@@ -685,7 +685,7 @@ def numba_funcify_Reshape(op, **kwargs):
 
         @numba_njit(inline="always")
         def reshape(x, shape):
-            return x.item()
+            return np.asarray(x.item())
 
     else:
 
