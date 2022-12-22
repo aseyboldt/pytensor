@@ -6,7 +6,7 @@ import pytest
 import pytensor.tensor as at
 import pytensor.tensor.inplace as ati
 import pytensor.tensor.math as aem
-from pytensor import config
+from pytensor import config, function
 from pytensor.compile.ops import deep_copy_op
 from pytensor.compile.sharedvalue import SharedVariable
 from pytensor.graph.basic import Constant
@@ -16,7 +16,7 @@ from pytensor.tensor.math import All, Any, Max, Mean, Min, Prod, ProdWithoutZero
 from pytensor.tensor.special import LogSoftmax, Softmax, SoftmaxGrad
 from tests.link.numba.test_basic import (
     compare_numba_and_py,
-    my_multi_out,
+    scalar_my_multi_out,
     set_test_value,
 )
 
@@ -99,8 +99,8 @@ rng = np.random.default_rng(42849)
                 rng.standard_normal(100).astype(config.floatX),
                 rng.standard_normal(100).astype(config.floatX),
             ],
-            lambda x, y: my_multi_out(x, y),
-            NotImplementedError,
+            lambda x, y: scalar_my_multi_out(x, y),
+            None,
         ),
     ],
 )
@@ -115,6 +115,25 @@ def test_Elemwise(inputs, input_vals, output_fn, exc):
     cm = contextlib.suppress() if exc is None else pytest.raises(exc)
     with cm:
         compare_numba_and_py(out_fg, input_vals)
+
+
+def test_elemwise_speed(benchmark):
+    x = at.dmatrix("y")
+    y = at.dvector("z")
+
+    out = np.exp(2 * x * y + y)
+
+    rng = np.random.default_rng(42)
+
+    x_val = rng.normal(size=(200, 500))
+    y_val = rng.normal(size=500)
+
+    func = function([x, y], out, mode="NUMBA")
+    func = func.vm.jit_fn
+    (out,) = func(x_val, y_val)
+    np.testing.assert_allclose(np.exp(2 * x_val * y_val + y_val), out)
+
+    benchmark(func, x_val, y_val)
 
 
 @pytest.mark.parametrize(
