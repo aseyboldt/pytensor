@@ -972,10 +972,7 @@ class Unbroadcast(COp):
         x = as_tensor_variable(x)
         if x.type.ndim <= max(self.axes):
             raise ValueError("Trying to unbroadcast of non-existent dimension")
-        shape = [
-            None if (sh == 1 and i in self.axes) else sh
-            for i, sh in enumerate(x.type.shape)
-        ]
+        shape = [None if i in self.axes else sh for i, sh in enumerate(x.type.shape)]
         return Apply(self, [x], [x.type.clone(shape=shape)()])
 
     def perform(self, node, inp, out_):
