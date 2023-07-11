@@ -3,6 +3,7 @@ import warnings
 import numba
 import numpy as np
 from numba.misc.special import literal_unroll
+from numpy.core.multiarray import normalize_axis_index  # type: ignore
 
 from pytensor import config
 from pytensor.link.numba.dispatch import basic as numba_basic
@@ -37,10 +38,8 @@ def numba_funcify_CumOp(op, node, **kwargs):
     mode = op.mode
     ndim = node.outputs[0].ndim
 
-    if axis < 0:
-        axis = ndim + axis
-    if axis < 0 or axis >= ndim:
-        raise ValueError(f"Invalid axis {axis} for array with ndim {ndim}")
+    if axis is not None:
+        axis = normalize_axis_index(axis, ndim)
 
     reaxis_first = (axis,) + tuple(i for i in range(ndim) if i != axis)
     reaxis_first_inv = tuple(np.argsort(reaxis_first))
@@ -51,6 +50,12 @@ def numba_funcify_CumOp(op, node, **kwargs):
             @numba_basic.numba_njit(fastmath=config.numba__fastmath)
             def cumop(x):
                 return np.cumsum(x)
+
+        elif axis is None:
+
+            @numba_basic.numba_njit(fastmath=config.numba__fastmath)
+            def cumop(x):
+                return np.cumsum(x.ravel())
 
         else:
 
@@ -75,6 +80,12 @@ def numba_funcify_CumOp(op, node, **kwargs):
             @numba_basic.numba_njit(fastmath=config.numba__fastmath)
             def cumop(x):
                 return np.cumprod(x)
+
+        elif axis is None:
+
+            @numba_basic.numba_njit(fastmath=config.numba__fastmath)
+            def cumop(x):
+                return np.cumprod(x.ravel())
 
         else:
 
