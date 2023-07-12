@@ -621,6 +621,31 @@ class Reshape(COp):
 
         if isinstance(shp, TensorConstant):
             out_shape = tuple(int(s) if s >= 0 else None for s in shp.data)
+            out_shape = []
+            count = 1
+            for data_length in x.type.shape:
+                if data_length is not None:
+                    count *= data_length
+                else:
+                    count = None
+
+            count_target = 1
+            neg_one_idx = None
+            for i, target_length in enumerate(shp.data):
+                if target_length != -1:
+                    out_shape.append(target_length)
+                    count_target *= target_length
+                else:
+                    assert neg_one_idx is None
+                    out_shape.append(None)
+                    neg_one_idx = i
+
+            if count is not None and neg_one_idx is not None:
+                missing = count // count_target
+                if count_target * missing != count:
+                    raise ValueError()
+                out_shape[neg_one_idx] = missing
+
         else:
             out_shape = [None] * self.ndim
             shp_list = shp_orig

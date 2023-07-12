@@ -991,11 +991,13 @@ def get_unique_constant_value(x: TensorVariable) -> Optional[Number]:
     if isinstance(x, Constant):
         data = x.data
 
-        if isinstance(data, np.ndarray) and data.ndim > 0:
+        if isinstance(data, np.ndarray):
             flat_data = data.ravel()
             if flat_data.shape[0]:
                 if (flat_data == flat_data[0]).all():
                     return flat_data[0]
+        elif isinstance(data, np.ScalarType):
+            return data
 
     return None
 
