@@ -153,6 +153,14 @@ def test_outputs_alias_inputs_views_and_each_other():
     np.testing.assert_allclose(f(X)[2], np.exp(X))
 
 
+def test_output_copies_take_packed_blocks():
+    # views returned as outputs are copied all at once, row by row or element by element
+    x = pt.tensor3("x")
+    outs = [x, x[:, 1:], x[:, :, ::2], x.T, x[::-1], x[:, :, :1]]
+    for X in [rng.random((4, 5, 6)), np.asfortranarray(rng.random((4, 5, 6))), rng.random((8, 5, 12))[::2, :, ::2]]:
+        compare([x], outs, [X])
+
+
 def test_kernel_outputs_of_units():
     # dynamic shapes inside a compiled unit: outputs are allocated by the unit
     x = pt.vector("x")
