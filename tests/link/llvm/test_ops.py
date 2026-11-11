@@ -209,6 +209,24 @@ def test_fused_elemwise_patterns():
     assert any(s.startswith("FusedElemwise") for s in tasks(f))
 
 
+def test_fused_reads_share_source():
+    # one table read through several index arrays stays one fused loop
+    tab, idx = pt.matrix("tab"), pt.lvector("idx")
+    out = (tab[idx] + tab[idx % 7] + tab[idx % 3]).sum()
+    f = compare([tab, idx], out, [rng.random((35, 5)), rng.integers(0, 35, 100)])
+    assert not any(s.startswith("AdvancedSubtensor") for s in tasks(f))
+
+
+def test_shared_gather_fuses_into_each_client():
+    # matrix factorization: U[i] and V[j] feed the prediction and both gradients
+    U, V, y = pt.matrix("U"), pt.matrix("V"), pt.vector("y")
+    i, j = pt.lvector("i"), pt.lvector("j")
+    loss = ((y - (U[i] * V[j]).sum(1)) ** 2).sum()
+    vals = [rng.random((7, 3)), rng.random((5, 3)), rng.random(40), rng.integers(0, 7, 40), rng.integers(0, 5, 40)]
+    f = compare([U, V, y, i, j], [loss, *pytensor.grad(loss, [U, V])], vals)
+    assert not any(s.startswith("AdvancedSubtensor") for s in tasks(f))
+
+
 def test_scan_sit_sot_mit_sot_nit_sot():
     x0 = pt.dscalar("x0")
     seq = pt.vector("seq")

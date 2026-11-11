@@ -94,16 +94,23 @@ def fused_spec(op, node):
                     "FusedElemwise: a source read through several indices"
                 )
             reads[s] = Read(n_elem + k, int(axis))
+
+    def is_input(v, j):
+        # inner inputs fed by one outer variable are merged (a table read through several indices)
+        return any(
+            v is iv and node.inputs[k] is node.inputs[j]
+            for k, iv in enumerate(inner.inputs)
+        )
+
     for j, e_in in enumerate(E.inputs):
-        src = inner.inputs[j]
         if reads[j] is not None:
             if not (
                 e_in.owner
                 and isinstance(e_in.owner.op, AdvancedSubtensor)
-                and e_in.owner.inputs[0] is src
+                and is_input(e_in.owner.inputs[0], j)
             ):
                 raise NotImplementedError("FusedElemwise: unexpected indexed read")
-        elif e_in is not src and not (
+        elif not is_input(e_in, j) and not (
             isinstance(node.inputs[j].type, ScalarType) and all(e_in.type.broadcastable)
         ):
             raise NotImplementedError("FusedElemwise: transformed Elemwise input")
