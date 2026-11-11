@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from pytensor.link.llvm.codegen.advanced import wrapped_index
 from pytensor.link.llvm.codegen.elemwise import identity_value
 from pytensor.link.llvm.codegen.emit import (
     Array,
@@ -253,14 +254,12 @@ def emit_fused(op, node, cg, inputs, outputs):
             plain_out[i] = Array(res.dtype, res.data, shape, res.strides)
 
     def index_value(k, i):
-        """idx[i] for index array input k, wrapped and bounds-checked against `n`."""
+        """idx[i] for index array input k (i64)."""
         return inputs[k].load(b, i).astype("int64").value
 
-    def checked(v, n, what):
-        v = b.select(b.slt(v, 0), b.add(v, n), v)
-        ok = b.and_(b.sge(v, 0), b.slt(v, n))
-        cg.check(ok, f"FusedElemwise: index out of bounds ({what})")
-        return v
+    def checked(k, i, n, what):
+        message = f"FusedElemwise: index out of bounds ({what})"
+        return wrapped_index(cg, index_value(k, i), n, node.inputs[k], message)
 
     def body(ptr_in, ptr_out, loop_index, accs):
         """One element. `ptr_in[j]`/`ptr_out[i]`: element pointers of the plain parts;
@@ -278,7 +277,7 @@ def emit_fused(op, node, cg, inputs, outputs):
             r = reads[j]
             if r is not None:
                 n = x.shape[r.axis]
-                ix = checked(index_value(r.index, loop_index[r.axis]), n, "read")
+                ix = checked(r.index, loop_index[r.axis], n, "read")
                 p = advance(b, p, ix, x.strides[r.axis], x.dtype)
             args.append((load(b, x.dtype, p), d))
         res = emit_scalar(E.op.scalar_op, b, args, out_dtypes)
@@ -300,7 +299,7 @@ def emit_fused(op, node, cg, inputs, outputs):
             elif isinstance(spec, Write):
                 res_arr = out_arrays[i][0]
                 n = res_arr.shape[spec.axis]
-                ix = checked(index_value(spec.index, loop_index[spec.axis]), n, "write")
+                ix = checked(spec.index, loop_index[spec.axis], n, "write")
                 p = advance(
                     b, ptr_out[i], ix, res_arr.strides[spec.axis], res_arr.dtype
                 )

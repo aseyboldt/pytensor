@@ -129,6 +129,16 @@ def test_join_and_reshape_errors():
         g(np.ones((2, 3)))
 
 
+def test_constant_indices_are_checked_when_generating():
+    # constant index arrays on axes of static length: wrapped, no run-time check unless out of range
+    x = pt.tensor("x", shape=(4, 3))
+    X = rng.random((4, 3))
+    rows, cols = np.array([0, -1, 3, -4]), np.array([2, 0])
+    compare([x], [x[rows], x[:, cols], pt.exp(x[rows]).sum(), pt.inc_subtensor(x[:, cols], x[:, :2])], [X])
+    with pytest.raises(Exception, match="out of bounds"):
+        pytensor.function([x], x[:, np.array([0, 3, 1])], mode=NO_FALLBACK)(X)
+
+
 def test_assert():
     from pytensor.raise_op import Assert
 
