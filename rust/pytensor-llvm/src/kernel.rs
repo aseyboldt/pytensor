@@ -250,6 +250,13 @@ impl Outputs<'_> {
         }
         // SAFETY: a valid input (`entry`'s contract).
         let (shape, strides) = unsafe { (source.shape(), source.strides()) };
+        // an axis the view drops must have length 1 (the type may not say so)
+        if let Some(a) = (0..shape.len()).find(|&a| shape[a] != 1 && !axes.contains(&Some(a))) {
+            return Err(format!(
+                "cannot drop axis {a} of length {} (not 1)",
+                shape[a]
+            ));
+        }
         // SAFETY: the output has shape storage of its ndim (`entry`'s contract; ndim
         // checked above), ours for the call.
         for (length, axis) in unsafe { out.shape_mut() }.iter_mut().zip(axes) {
