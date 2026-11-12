@@ -214,6 +214,16 @@ def test_assert():
         f(-np.ones(3))
 
 
+def test_dot_mixed_dtypes():
+    # operands are cast to the output dtype (llvm_dot_upcast): no numba fallback
+    a, v = pt.lmatrix("a"), pt.dvector("v")
+    compare(
+        [a, v],
+        [pt.dot(a, v), pt.dot(v[:3], a)],
+        [np.arange(12).reshape(3, 4), np.linspace(0, 1, 4)],
+    )
+
+
 @pytest.mark.parametrize("axis", [0, 1, -1])
 @pytest.mark.parametrize("op", [pt.cumsum, pt.cumprod])
 def test_cumop(op, axis):
