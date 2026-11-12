@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import pytensor.scalar.basic as ps
+from pytensor.graph.basic import Constant
 from pytensor.link.llvm.codegen.emit import Array, advance, cast, for_each, load, store
 from pytensor.link.llvm.codegen.function import llvm_emit, llvm_inplace
 from pytensor.link.llvm.codegen.scalar import emit_scalar
@@ -98,6 +99,22 @@ def operands(cg, base: Array, pat: Pattern):
     return base_op, idx_ops
 
 
+def wrapped_index(cg, i, n, var, message):
+    """Index `i` (i64) into an axis of length `n`: negative ones wrap, out-of-range ones
+    fail. For a constant index array `var` and a static length this is settled here."""
+    b = cg.b
+    lo, hi = (
+        (int(var.data.min()), int(var.data.max()))
+        if isinstance(var, Constant) and var.data.size
+        else (None, None)
+    )
+    if lo is None or lo < 0:
+        i = b.select(b.slt(i, 0), b.add(i, n), i)
+    if lo is None or n.const_int is None or lo < -n.const_int or hi >= n.const_int:
+        cg.check(b.and_(b.sge(i, 0), b.slt(i, n)), message)
+    return i
+
+
 def element(cg, base: Array, pat: Pattern, base_ptr, idx_ptrs, what):
     """Pointer to the indexed element of `base`: base_ptr plus the index offsets
     (negative indices wrap; out-of-range ones fail)."""
@@ -105,11 +122,14 @@ def element(cg, base: Array, pat: Pattern, base_ptr, idx_ptrs, what):
     p = base_ptr
     for j, ((arr, var), ip) in enumerate(zip(pat.indices, idx_ptrs, strict=True)):
         axis = pat.first + j
-        n = base.shape[axis]
         i = cast(b, load(b, arr.dtype, ip), arr.dtype, "int64")
-        i = b.select(b.slt(i, 0), b.add(i, n), i)
-        ok = b.and_(b.sge(i, 0), b.slt(i, n))
-        cg.check(ok, f"index out of bounds for axis {axis} ({what})")
+        i = wrapped_index(
+            cg,
+            i,
+            base.shape[axis],
+            var,
+            f"index out of bounds for axis {axis} ({what})",
+        )
         p = advance(b, p, i, base.strides[axis], base.dtype)
     return p
 

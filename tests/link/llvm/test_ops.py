@@ -129,6 +129,16 @@ def test_join_and_reshape_errors():
         g(np.ones((2, 3)))
 
 
+def test_constant_indices_are_checked_when_generating():
+    # constant index arrays on axes of static length: wrapped, no run-time check unless out of range
+    x = pt.tensor("x", shape=(4, 3))
+    X = rng.random((4, 3))
+    rows, cols = np.array([0, -1, 3, -4]), np.array([2, 0])
+    compare([x], [x[rows], x[:, cols], pt.exp(x[rows]).sum(), pt.inc_subtensor(x[:, cols], x[:, :2])], [X])
+    with pytest.raises(Exception, match="out of bounds"):
+        pytensor.function([x], x[:, np.array([0, 3, 1])], mode=NO_FALLBACK)(X)
+
+
 def test_assert():
     from pytensor.raise_op import Assert
 
@@ -137,6 +147,19 @@ def test_assert():
     f = compare([x], out, [np.ones(3)])
     with pytest.raises(Exception, match="x must be positive"):
         f(-np.ones(3))
+
+
+def test_dot_mixed_dtypes():
+    # operands are cast to the output dtype (llvm_dot_upcast): no numba fallback
+    a, v = pt.lmatrix("a"), pt.dvector("v")
+    compare([a, v], [pt.dot(a, v), pt.dot(v[:3], a)], [np.arange(12).reshape(3, 4), np.linspace(0, 1, 4)])
+
+
+def test_constant_bool_mask():
+    # boolean masks become integer indices (bool_idx_to_nonzero): no numba fallback
+    x, y = pt.vector("x"), pt.vector("y")
+    mask = np.array([True, False, True, True, False])
+    compare([x, y], [x[mask], pt.set_subtensor(x[mask], y)], [rng.random(5), rng.random(3)])
 
 
 @pytest.mark.parametrize("axis", [0, 1, -1])
@@ -194,6 +217,24 @@ def test_fused_elemwise_patterns():
     ]
     f = compare([x, y, idx, m], outs, [rng.random(10), rng.random(30), rng.integers(0, 10, 30), rng.random((5, 7))])
     assert any(s.startswith("FusedElemwise") for s in tasks(f))
+
+
+def test_fused_reads_share_source():
+    # one table read through several index arrays stays one fused loop
+    tab, idx = pt.matrix("tab"), pt.lvector("idx")
+    out = (tab[idx] + tab[idx % 7] + tab[idx % 3]).sum()
+    f = compare([tab, idx], out, [rng.random((35, 5)), rng.integers(0, 35, 100)])
+    assert not any(s.startswith("AdvancedSubtensor") for s in tasks(f))
+
+
+def test_shared_gather_fuses_into_each_client():
+    # matrix factorization: U[i] and V[j] feed the prediction and both gradients
+    U, V, y = pt.matrix("U"), pt.matrix("V"), pt.vector("y")
+    i, j = pt.lvector("i"), pt.lvector("j")
+    loss = ((y - (U[i] * V[j]).sum(1)) ** 2).sum()
+    vals = [rng.random((7, 3)), rng.random((5, 3)), rng.random(40), rng.integers(0, 7, 40), rng.integers(0, 5, 40)]
+    f = compare([U, V, y, i, j], [loss, *pytensor.grad(loss, [U, V])], vals)
+    assert not any(s.startswith("AdvancedSubtensor") for s in tasks(f))
 
 
 def test_scan_sit_sot_mit_sot_nit_sot():

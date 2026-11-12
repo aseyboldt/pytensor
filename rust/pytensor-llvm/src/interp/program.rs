@@ -893,7 +893,8 @@ pub unsafe extern "C-unwind" fn ptl_program_call(
     }
 }
 
-/// Copy elements between two arrays of the same shape.
+/// Copy elements between two arrays of the same shape: the trailing axes both hold
+/// packed are copied as one block (whole rows, or everything at once).
 ///
 /// # Safety
 /// Both describe valid memory of `shape` with their strides; they don't overlap.
@@ -905,9 +906,15 @@ pub unsafe fn copy_strided(
     dst_strides: &[i64],
     itemsize: usize,
 ) {
-    let nd = shape.len();
     if shape.contains(&0) {
         return;
+    }
+    let (mut block, mut nd) = (itemsize as i64, shape.len());
+    while nd > 0
+        && (shape[nd - 1] == 1 || (src_strides[nd - 1] == block && dst_strides[nd - 1] == block))
+    {
+        block *= shape[nd - 1];
+        nd -= 1;
     }
     let mut idx = vec![0i64; nd];
     loop {
@@ -916,8 +923,9 @@ pub unsafe fn copy_strided(
             so += (idx[a] * src_strides[a]) as isize;
             d += (idx[a] * dst_strides[a]) as isize;
         }
-        // SAFETY: the offsets stay inside both arrays (index < shape on every axis).
-        unsafe { std::ptr::copy_nonoverlapping(src.offset(so), dst.offset(d), itemsize) };
+        // SAFETY: the offsets stay inside both arrays (index < shape on every axis), and
+        // so does the block: both arrays are packed over the trailing axes.
+        unsafe { std::ptr::copy_nonoverlapping(src.offset(so), dst.offset(d), block as usize) };
         let mut a = nd;
         loop {
             if a == 0 {
