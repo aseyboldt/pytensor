@@ -9,6 +9,7 @@ import numpy as np
 import pytensor.scalar.basic as ps
 import pytensor.scalar.math as ps_math
 from pytensor.assumptions import DIAGONAL, UNIT_MAGNITUDE, check_assumption
+from pytensor.compile import optdb
 from pytensor.graph.basic import Constant, Variable
 from pytensor.graph.rewriting.basic import (
     NodeRewriter,
@@ -475,6 +476,25 @@ def local_dot_to_mul(fgraph, node):
     new_out = mul(a, b)
     copy_stack_trace(node.out, new_out)
     return [new_out]
+
+
+@node_rewriter([Dot])
+def llvm_dot_upcast(fgraph, node):
+    """Cast the operands of a mixed-dtype Dot to its output dtype (the LLVM Dot kernel takes one)."""
+    dtype = node.outputs[0].type.dtype
+    if dtype not in ("float32", "float64") or all(
+        i.type.dtype == dtype for i in node.inputs
+    ):
+        return None
+    new_out = node.op(*(i.astype(dtype) for i in node.inputs))
+    copy_stack_trace(node.out, new_out)
+    return [new_out]
+
+
+# opt-in by name (the LLVM mode includes it); in specialize so casts of constants are folded
+optdb["specialize"].register(
+    "llvm_dot_upcast", llvm_dot_upcast, use_db_name_as_tag=False
+)
 
 
 for pair in (
