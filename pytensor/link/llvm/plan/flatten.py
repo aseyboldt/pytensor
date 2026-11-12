@@ -111,9 +111,26 @@ def group_scalars(values: Values, items, graph_outputs) -> list:
     as_tensor = {}  # scalar vid -> 0-d tensor vid carrying it out of its group
     out = []  # items outside groups, and group placeholders (ints)
     produced, tainted = set(), set()
+    # A node that overwrites an input runs after the groups that read that memory (one
+    # in a group gets new memory: units don't grant in-place)
+    root = {}  # vid -> the vid whose memory it may view
+    readers = {}  # root vid -> groups reading it
+    after = {}  # position in `out` -> groups that must run before it
     for it in items:
+        destroyed = set()
+        if isinstance(it, NodeItem):
+            op = it.node.op
+            for o, (i, *_) in getattr(op, "view_map", {}).items():
+                root[it.outputs[o]] = root.get(it.inputs[i], it.inputs[i])
+            for i, *_ in getattr(op, "destroy_map", {}).values():
+                destroyed.add(root.get(it.inputs[i], it.inputs[i]))
         if not touches(it):
-            if any(k in produced or k in tainted for k in it.inputs):
+            before = {g for r in destroyed for g in readers.get(r, ())}
+            if before:
+                after[len(out)] = before
+            if len(groups) - 1 in before or any(
+                k in produced or k in tainted for k in it.inputs
+            ):
                 tainted.update(o[1] if isinstance(o, tuple) else o for o in it.outputs)
             out.append(it)
             continue
@@ -144,6 +161,8 @@ def group_scalars(values: Values, items, graph_outputs) -> list:
             ins[pos] = k2
         it = NodeItem(it.node, ins, it.outputs) if ins != it.inputs else it
         groups[g].append(it)
+        for k in it.inputs:
+            readers.setdefault(root.get(k, k), set()).add(g)
         for k in it.outputs:
             produced.add(k)
             if k in is_scalar:
@@ -172,7 +191,8 @@ def group_scalars(values: Values, items, graph_outputs) -> list:
                         )
                     outputs.append((k, k))
         result.append(UnitItem(sub, values.unit_inputs(sub), outputs, "scalars"))
-    return toposort_items(result)
+    at = {x: pos for pos, x in enumerate(out) if isinstance(x, int)}
+    return toposort_items(result, {p: {at[g] for g in gs} for p, gs in after.items()})
 
 
 def fusable(op, node) -> bool:
@@ -195,11 +215,14 @@ def _outputs_of(it):
     return it.outputs
 
 
-def toposort_items(items):
-    """Order items by data dependencies, keeping the given order where possible."""
+def toposort_items(items, extra=None):
+    """Order items by data dependencies (and `extra`: index -> indices that must run
+    before it), keeping the given order where possible."""
     producer = {k: i for i, it in enumerate(items) for k in _outputs_of(it)}
+    extra = extra or {}
     deps = [
         {producer[k] for k in it.inputs if k in producer and producer[k] != i}
+        | extra.get(i, set())
         for i, it in enumerate(items)
     ]
     done, order = set(), []
@@ -216,7 +239,7 @@ def toposort_items(items):
                 rest.append(i)
         if not progress:
             raise NotImplementedError(
-                "scalar operations interleaved with other nodes (a cycle)"
+                "scalar operations interleaved with other nodes or with what overwrites their inputs (a cycle)"
             )
         pending = rest
     return order

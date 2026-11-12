@@ -266,3 +266,12 @@ def test_scalar_graph_input():
     out = x * tensor_from_scalar(s * 2)
     f = pytensor.function([s, x], out, mode=LLVM)
     np.testing.assert_allclose(f(1.5, np.arange(3.0)), np.arange(3.0) * 3)
+
+
+def test_units_respect_destroy_orderings():
+    # r reads v before the write destroys v, m reads the write: r and m in one unit
+    # would have to run both before and after the write
+    x, y = pt.tensor("x", shape=(3,)), pt.tensor("y", shape=(2,))
+    v = pt.sort(x)
+    w = pt.set_subtensor(v[pt.constant([0, 2])], y)
+    compare([x, y], [v.sum() * 2, w + 1], [rng.random(3), rng.random(2)])

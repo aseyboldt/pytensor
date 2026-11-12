@@ -42,20 +42,23 @@ class GroupIntoUnits(GraphRewriter):
         )
 
     def groups(self, fgraph):
-        """Convex groups of eligible nodes, in topological order."""
+        """Convex groups of eligible nodes, in topological order. Paths count the
+        orderings of destroyed inputs (a reader runs before the destroyer) as edges."""
+        orderings = fgraph.orderings()
         groups, current = [], []
-        in_group = set()  # variables produced by the current group
-        tainted = set()  # variables that depend on the current group through other nodes
+        members = set()  # nodes of the current group
+        tainted = set()  # nodes that depend on the current group through other nodes
         for node in fgraph.toposort():
+            before = {i.owner for i in node.inputs} | set(orderings.get(node, ()))
             if self.eligible(node):
-                if any(i in tainted for i in node.inputs):
+                if before & tainted:
                     # would make the group non-convex: start a new one
                     groups.append(current)
-                    current, in_group, tainted = [], set(), set()
+                    current, members, tainted = [], set(), set()
                 current.append(node)
-                in_group.update(node.outputs)
-            elif any(i in in_group or i in tainted for i in node.inputs):
-                tainted.update(node.outputs)
+                members.add(node)
+            elif before & members or before & tainted:
+                tainted.add(node)
         groups.append(current)
         return [g for g in groups if len(g) > 1]
 

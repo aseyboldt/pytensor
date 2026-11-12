@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 import pytensor
+import pytensor.scalar as ps
 import pytensor.tensor as pt
 from pytensor import In
 from pytensor.compile.builders import OpFromGraph
@@ -13,6 +14,8 @@ from pytensor.graph.basic import Apply
 from pytensor.graph.destroyhandler import DestroyHandler
 from pytensor.graph.fg import FunctionGraph
 from pytensor.graph.op import Op
+from pytensor.tensor.basic import scalar_from_tensor, tensor_from_scalar
+from pytensor.tensor.elemwise import Elemwise
 
 
 pytest.importorskip("pytensor_llvm.ir")
@@ -25,7 +28,9 @@ from pytensor.link.llvm.codegen.function import (  # noqa: E402
     llvm_inplace,
     node_outputs,
 )
+from pytensor.link.llvm.plan.flatten import group_scalars  # noqa: E402
 from pytensor.link.llvm.plan.memory import plan_memory  # noqa: E402
+from pytensor.link.llvm.plan.values import NodeItem, UnitItem, Values  # noqa: E402
 from pytensor.link.llvm.program import Options, build_program  # noqa: E402
 from pytensor.link.numba.dispatch.basic import numba_funcify, numba_njit  # noqa: E402
 from tests.link.llvm.test_aliasing import task, values_of  # noqa: E402
@@ -306,3 +311,24 @@ def test_an_overwritten_value_lives_on_under_another_name():
     tasks = [task([0], [1], [P]), task([1], [2], [I], [(0,)])]
     m = plan_memory(v, tasks, in_ids=[0], out_ids=[2])
     assert m.same == {2: 1} and 1 not in m.offsets and m.arena_bytes == 0
+
+
+def test_scalar_groups_run_before_what_overwrites_their_inputs():
+    # r reads (a view of) x and makes a scalar; d overwrites x; q makes a scalar of
+    # d's result. Grouping r and q into one unit would run r after d.
+    values = Values()
+    x, v, w, u = (values.new(pt.dvector().type) for _ in range(4))
+    s, t, st = (values.new(ps.float64) for _ in range(3))
+    vec, sc = pt.dvector(), ps.float64()
+    d = NodeItem(Elemwise(ps.log, {0: 0})(vec).owner, [x], [w])
+    items = [
+        NodeItem(vec[:].owner, [x], [v]),
+        NodeItem(scalar_from_tensor(pt.dscalar()).owner, [v], [s]),
+        d,
+        NodeItem(scalar_from_tensor(pt.dscalar()).owner, [w], [t]),
+        NodeItem(ps.add(sc, sc).owner, [s, t], [st]),
+        NodeItem(tensor_from_scalar(sc).owner, [st], [u]),
+    ]
+    order = group_scalars(values, items, {u})
+    reads_s = next(i for i, it in enumerate(order) if isinstance(it, UnitItem))
+    assert reads_s < order.index(d)
