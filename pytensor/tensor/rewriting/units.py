@@ -14,11 +14,13 @@ from pytensor.compile.builders import OpFromGraph, Execution
 from pytensor.compile import optdb
 from pytensor.graph.basic import Constant
 from pytensor.graph.rewriting.basic import GraphRewriter
+from pytensor.tensor.basic import Alloc, Join, MakeVector
 from pytensor.tensor.elemwise import CAReduce, DimShuffle, Elemwise
+from pytensor.tensor.subtensor import Subtensor
 from pytensor.tensor.type import TensorType
 
 
-GROUPABLE = (Elemwise, CAReduce, DimShuffle)
+GROUPABLE = (Elemwise, CAReduce, DimShuffle, Subtensor, MakeVector, Join, Alloc)
 
 
 def _small(v, max_elems):

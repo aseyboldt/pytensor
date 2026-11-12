@@ -63,6 +63,18 @@ def test_small_static_graph_is_one_unit():
     assert i["tasks"][0].startswith("unit[")
 
 
+def test_indexing_and_joins_are_in_the_unit():
+    # a raveled parameter vector: split by indexing, gradients joined back
+    x = pt.tensor("x", shape=(5,))
+    a, b, c = x[0], x[1:3], x[3:]
+    logp = pt.exp(a) * b.sum() + pt.stack([a, c.sum()]).sum()
+    ga, gb, gc = pt.grad(logp, [a, b, c])
+    f = compare([x], [logp, pt.concatenate([ga[None], gb, gc])], [rng.random(5)])
+    i = info(f)
+    assert i["n_tasks"] == 1
+    assert i["tasks"][0].startswith("unit[")
+
+
 def test_arena_reuses_temporaries():
     # large static intermediates aren't grouped: each is a step whose output lives in
     # the arena, which reuses memory by liveness
