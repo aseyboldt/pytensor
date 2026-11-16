@@ -545,6 +545,33 @@ def test_fused_writes_in_chunks():
     assert any(s.startswith("FusedElemwise") and "reduce" in s for s in tasks(f))
 
 
+def test_shared_scatter_fuses_into_one_loop():
+    # one value written into the tables of several factors: one loop reads it once;
+    # also a single write of a value no Elemwise computes
+    g, a, w = pt.matrix("g"), pt.matrix("a"), pt.matrix("w")
+    i, j = pt.lvector("i"), pt.lvector("j")
+    t1, t2, t3 = pt.matrix("t1"), pt.matrix("t2"), pt.tensor3("t3")
+    outs = [
+        pt.inc_subtensor(t1[i], g),
+        pt.inc_subtensor(t2[j], g),
+        pt.inc_subtensor(t3[i, j], g),
+        pt.inc_subtensor(t1[i], a @ w),
+    ]
+    vals = [
+        rng.random((300, 7)),
+        rng.random((300, 4)),
+        rng.random((4, 7)),
+        rng.integers(-5, 5, 300),
+        rng.integers(0, 6, 300),
+        rng.random((5, 7)),
+        rng.random((6, 7)),
+        rng.random((5, 6, 7)),
+    ]
+    f = compare([g, a, w, i, j, t1, t2, t3], outs, vals)
+    assert not any(s.startswith("AdvancedIncSubtensor") for s in tasks(f))
+    assert sum(s.startswith("FusedElemwise") for s in tasks(f)) == 2
+
+
 def test_fused_index_checks_dont_branch():
     # bad indices fail after the loop, which vectorizes; an empty table fails before it
     tab, idx = pt.vector("tab"), pt.lvector("idx")

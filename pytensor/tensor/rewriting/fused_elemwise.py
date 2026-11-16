@@ -993,3 +993,77 @@ fused_elemwise_optdb.register(
     position=-0.7,
     use_db_name_as_tag=False,
 )
+
+
+def _fusable_write(fgraph, node, value):
+    """`node` writes `value` (unbroadcast) through indices FuseElemwise can absorb?"""
+    if not isinstance(node.op, AdvancedIncSubtensor) or node.inputs[1] is not value:
+        return False
+    if FuseElemwise._extract_idx_axis_pairs(node, write=True) is None:
+        return False
+    target, _, *idx = node.inputs
+    indexed = AdvancedSubtensor(idx_list=node.op.idx_list)(target, *idx).type
+    return indexed.broadcastable == value.type.broadcastable
+
+
+class SplitSharedScatter(GraphRewriter):
+    """Give each indexed write of a value its own output of one identity Elemwise, which
+    FuseElemwise then turns into one loop reading the value once for all the writes (a
+    gradient scattered into the tables of several factors). Also for a single write of
+    a value no Elemwise computes."""
+
+    def apply(self, fgraph):
+        values = [*fgraph.inputs, *(o for n in fgraph.toposort() for o in n.outputs)]
+        for v in values:
+            if not isinstance(v, TensorVariable) or v.ndim == 0:
+                continue
+            writers = list(
+                dict.fromkeys(
+                    c
+                    for c, i in fgraph.clients.get(v, [])
+                    if i == 1 and _fusable_write(fgraph, c, v)
+                )
+            )
+            if not writers or (
+                len(writers) == 1 and v.owner and isinstance(v.owner.op, Elemwise)
+            ):
+                continue
+            x = get_scalar_type(v.type.dtype)()
+            outs = Elemwise(Composite([x], [scalar_identity(x)] * len(writers)))(
+                v, return_list=True
+            )
+            for c, o in zip(writers, outs, strict=True):
+                fgraph.change_node_input(c, 1, o, reason="split_shared_scatter")
+
+
+@node_rewriter([Elemwise])
+def local_unfused_identity(fgraph, node):
+    """An identity Elemwise left by SplitSharedScatter that didn't fuse: its input."""
+    s = node.op.scalar_op
+    if isinstance(s, Composite) and all(
+        o is s.inputs[0]
+        or (
+            o.owner
+            and o.owner.op == scalar_identity
+            and o.owner.inputs[0] is s.inputs[0]
+        )
+        for o in s.outputs
+    ):
+        return [node.inputs[0]] * len(node.outputs)
+    return None
+
+
+fused_elemwise_optdb.register(
+    "llvm_split_shared_scatter",
+    SplitSharedScatter(),
+    "llvm",
+    position=-0.6,
+    use_db_name_as_tag=False,
+)
+fused_elemwise_optdb.register(
+    "llvm_unfused_identity",
+    dfs_rewriter(local_unfused_identity),
+    "llvm",
+    position=0.5,
+    use_db_name_as_tag=False,
+)
