@@ -264,6 +264,24 @@ fn matmul<T: Float>(
             };
             return;
         }
+        // contiguous columns (A^T x with A row-major): axpy over 4 columns at a time
+        if matrix.row_stride() == 1 && y.row_stride() == 1 && rows >= 4 {
+            // SAFETY: `matrix` has `k` columns of `rows` adjacent elements, `col_stride`
+            // apart; `x` has `k` elements `row_stride` apart; `y` has `rows` adjacent
+            // elements, ours to write.
+            unsafe {
+                simd::gemv_columns(
+                    rows,
+                    k,
+                    matrix.as_ptr(),
+                    matrix.col_stride(),
+                    x.as_ptr(),
+                    x.row_stride(),
+                    y.as_ptr_mut(),
+                )
+            };
+            return;
+        }
     }
     faer::linalg::matmul::matmul(dst, faer::Accum::Replace, lhs, rhs, T::one_impl(), par);
 }
@@ -338,6 +356,81 @@ mod simd {
         gemv_short_rows_impl::<T, true>(m, k, a, rsa, x, y, incy)
     }
 
+    /// y = A x for A with contiguous columns, 4 columns at a time (y stays in cache).
+    #[inline(always)]
+    unsafe fn gemv_columns_impl<T: Float, const FMA: bool>(
+        m: usize,
+        k: usize,
+        a: *const T,
+        csa: isize,
+        x: *const T,
+        incx: isize,
+        y: *mut T,
+    ) {
+        let y = std::slice::from_raw_parts_mut(y, m);
+        y.fill(T::default());
+        let column = |j: usize| a.offset(j as isize * csa);
+        let at = |j: usize| *x.offset(j as isize * incx);
+        let mut j = 0;
+        while j + 4 <= k {
+            let (c, xs) = (
+                [0, 1, 2, 3].map(|q| column(j + q)),
+                [0, 1, 2, 3].map(|q| at(j + q)),
+            );
+            for (i, yi) in y.iter_mut().enumerate() {
+                *yi = yi
+                    .madd::<FMA>(*c[0].add(i), xs[0])
+                    .madd::<FMA>(*c[1].add(i), xs[1])
+                    .madd::<FMA>(*c[2].add(i), xs[2])
+                    .madd::<FMA>(*c[3].add(i), xs[3]);
+            }
+            j += 4;
+        }
+        for j in j..k {
+            let (c, xj) = (column(j), at(j));
+            for (i, yi) in y.iter_mut().enumerate() {
+                *yi = yi.madd::<FMA>(*c.add(i), xj);
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn gemv_columns_avx2<T: Float>(
+        m: usize,
+        k: usize,
+        a: *const T,
+        csa: isize,
+        x: *const T,
+        incx: isize,
+        y: *mut T,
+    ) {
+        gemv_columns_impl::<T, true>(m, k, a, csa, x, incx, y)
+    }
+
+    /// `y = A x` for `k` columns of `m` adjacent elements, `csa` elements apart, `x` of
+    /// `k` elements `incx` apart, and `y` of `m` adjacent elements.
+    ///
+    /// # Safety
+    /// The pointers are valid for those elements, and `y` overlaps neither `A` nor `x`.
+    pub unsafe fn gemv_columns<T: Float>(
+        m: usize,
+        k: usize,
+        a: *const T,
+        csa: isize,
+        x: *const T,
+        incx: isize,
+        y: *mut T,
+    ) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+                return gemv_columns_avx2(m, k, a, csa, x, incx, y);
+            }
+        }
+        gemv_columns_impl::<T, false>(m, k, a, csa, x, incx, y)
+    }
+
     /// `y = A x` for `m` rows of `k` adjacent elements, `rsa` elements apart, `x` of `k`
     /// adjacent elements, and `y` of `m` elements `incy` apart. (The crate is built for
     /// baseline x86-64; this picks the AVX2+FMA version when the machine has it.)
@@ -398,30 +491,32 @@ impl<T: Float> FaerKernel for Cholesky<T> {
         if !self.lower {
             (source, factor) = (source.transpose(), factor.transpose_mut());
         }
-        // (all of it: faer's small-matrix code reads whole rows, the output may be fresh)
-        for j in 0..n {
-            for i in 0..n {
-                factor[(i, j)] = if i >= j { source[(i, j)] } else { T::ZERO };
-            }
-        }
-        let work = cholesky_in_place_scratch::<T>(n, par, Default::default());
-        let stack = MemStack::new(scratch::<u8>(ctx, work.unaligned_bytes_required()));
+        // in a zeroed column-major copy: faer is about twice as fast on those
+        let req = StackReq::all_of(&[
+            temp_mat_scratch::<T>(n, n),
+            cholesky_in_place_scratch::<T>(n, par, Default::default()),
+        ]);
+        let (mut l, stack) = temp_mat_zeroed::<T, _, _>(n, n, stack_for(ctx, req));
+        let mut l = l.as_mat_mut();
+        l.copy_from_triangular_lower(source);
         let ok = cholesky_in_place(
-            factor.rb_mut(),
+            l.rb_mut(),
             Default::default(),
             par,
             stack,
             Default::default(),
         )
         .is_ok();
-        // faer leaves the other triangle unspecified; LAPACK-clean output zeroes it
-        for j in 0..n {
-            for i in 0..n {
-                if !ok {
-                    factor[(i, j)] = T::NAN;
-                } else if i < j {
-                    factor[(i, j)] = T::ZERO;
-                }
+        // LAPACK-clean output: the other triangle zeroed, all NaN on failure
+        for i in 0..n {
+            for j in 0..n {
+                factor[(i, j)] = if !ok {
+                    T::NAN
+                } else if i >= j {
+                    l[(i, j)]
+                } else {
+                    T::ZERO
+                };
             }
         }
         Ok(())

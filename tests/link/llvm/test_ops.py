@@ -224,6 +224,14 @@ def test_dot_mixed_dtypes():
     )
 
 
+def test_dot_of_contiguous_columns():
+    # A^T v with A row-major: column kernel, with a tail of columns and a strided v
+    a, v = pt.matrix("a"), pt.vector("v")
+    m, x = rng.normal(size=(7, 30)), rng.normal(size=14)
+    m[3, 5] = np.inf
+    compare([a, v], [a.T @ v[::2], v[:7] @ a], [m, x])
+
+
 @pytest.mark.parametrize("axis", [0, 1, -1])
 @pytest.mark.parametrize("op", [pt.cumsum, pt.cumprod])
 def test_cumop(op, axis):
@@ -276,6 +284,14 @@ def test_cholesky_and_solve_triangular(lower):
     compare([a, b, bv], outs, [spd, rng.random((5, 3)), rng.random(5)], rtol=1e-8)
     f = pytensor.function([a], cholesky(a, lower=lower), mode=NO_FALLBACK)
     assert np.isnan(f(-np.eye(3))).all()
+    # only the one triangle is read, also past faer's small-matrix sizes
+    m = rng.random((70, 70))
+    spd = m @ m.T + 70 * np.eye(70)
+    np.testing.assert_allclose(
+        f(spd + (np.triu if lower else np.tril)(np.ones((70, 70)), 1 if lower else -1)),
+        np.linalg.cholesky(spd) if lower else np.linalg.cholesky(spd).T,
+        rtol=1e-10,
+    )
 
 
 @pytest.mark.parametrize("dtype", ["float64", "float32", "int64", "uint8", "bool"])
