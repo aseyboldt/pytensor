@@ -297,6 +297,21 @@ def index_bounds(var):
     return None, None
 
 
+def clamped_index(b, i, n, bounds=(None, None)):
+    """`checked_index` without the branch: (the index, negative values wrapped and bad
+    ones replaced by 0; whether it was good, None if known)."""
+    if i.const_int is not None:
+        bounds = (i.const_int, i.const_int)
+    lo, hi = bounds
+    if lo is None or lo < 0:
+        i = b.select(b.slt(i, 0), b.add(i, n), i)
+    nc = n.const_int
+    if lo is None or hi is None or nc is None or lo < -nc or hi >= nc:
+        ok = b.ult(i, n)
+        return b.select(ok, i, b.i64(0)), ok
+    return i, None
+
+
 def checked_index(cg, i, n, message, bounds=(None, None)):
     """Index `i` (i64) into an axis of length `n`: negative values wrap, out-of-range
     ones fail with `message`. Generates only what `bounds` (`index_bounds`), a constant

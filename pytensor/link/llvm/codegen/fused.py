@@ -20,7 +20,7 @@ from pytensor.link.llvm.codegen.emit import (
     ScalarOutput,
     advance,
     cast,
-    checked_index,
+    clamped_index,
     constant,
     copy,
     for_each,
@@ -35,7 +35,7 @@ from pytensor.link.llvm.codegen.emit import (
 )
 from pytensor.link.llvm.codegen.function import llvm_emit
 from pytensor.link.llvm.codegen.scalar import emit_scalar
-from pytensor.link.llvm.codegen.types import check_dtype
+from pytensor.link.llvm.codegen.types import check_dtype, ir
 from pytensor.link.llvm.layout import DYNAMIC, Layout
 from pytensor.scalar.basic import ScalarType, add
 from pytensor.tensor.elemwise import Elemwise
@@ -318,14 +318,37 @@ def emit_fused(op, node, cg, inputs, outputs):
         ]
         return inputs[k].load(b, *at).astype("int64").value
 
+    # Index checks don't branch, so the loops vectorize: a bad index is replaced by 0
+    # and sets a flag, which fails after the loops; an empty indexed axis fails before.
+    flags = {}
+    loop_size = size(b, shape)
+    for what, arr, rs in [
+        *(("read", inputs[j], reads[j]) for j in range(n_elem) if reads[j]),
+        *(
+            ("write", out_arrays[i][0], s.reads)
+            for i, s in enumerate(outs)
+            if isinstance(s, Write)
+        ),
+    ]:
+        msg = f"FusedElemwise: index out of bounds ({what})"
+        if what not in flags:
+            flags[what] = (b.alloca(ir.i8), msg)
+            b.store(constant(b, "int8", 0), flags[what][0])
+        for r in rs:
+            n = arr.shape[r.axis]
+            cg.check(b.or_(b.sgt(n, b.i64(0)), b.eq(loop_size, b.i64(0))), msg)
+
     def checked(v, n, what, k):
-        return checked_index(
-            cg,
-            v,
-            n,
-            f"FusedElemwise: index out of bounds ({what})",
-            index_bounds(node.inputs[k]),
-        )
+        i, ok = clamped_index(b, v, n, index_bounds(node.inputs[k]))
+        if ok is not None:
+            flag = flags[what][0]
+            bad = b.zext(b.not_(ok), ir.i8)
+            b.store(b.or_(b.load(ir.i8, flag), bad), flag)
+        return i
+
+    def check_flags():
+        for flag, msg in flags.values():
+            cg.check(b.eq(b.load(ir.i8, flag), constant(b, "int8", 0)), msg)
 
     def body(ptr_in, ptr_out, loop_index, accs, runs=None):
         """One element. `ptr_in[j]`/`ptr_out[i]`: element pointers of the plain parts;
@@ -509,6 +532,7 @@ def emit_fused(op, node, cg, inputs, outputs):
     )
     if not flat_ok:
         nest()
+        check_flags()
         _finish(cg, outs, out_arrays, scalar_outs)
         return
 
@@ -554,6 +578,7 @@ def emit_fused(op, node, cg, inputs, outputs):
         nest()
     else:
         b.if_else(contig, flat, nest)
+    check_flags()
     _finish(cg, outs, out_arrays, scalar_outs)
 
 

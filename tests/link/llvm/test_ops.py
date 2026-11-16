@@ -523,6 +523,20 @@ def test_fused_multi_axis_indices():
         f(*vals[:3], vals[3] + 6, *vals[4:])
 
 
+def test_fused_index_checks_dont_branch():
+    # bad indices fail after the loop, which vectorizes; an empty table fails before it
+    tab, idx = pt.vector("tab"), pt.lvector("idx")
+    f = compare(
+        [tab, idx], pt.exp(tab[idx]).sum(), [rng.random(7), np.array([1, -7, 6])]
+    )
+    ir = "".join(m.optimized_ir() for m in f.maker.linker.stats.modules)
+    assert "llvm.vector.reduce.or" in ir
+    for t, i in [(rng.random(7), np.array([1, 7, 2])), (np.zeros(0), np.array([0]))]:
+        with pytest.raises(Exception, match="index out of bounds"):
+            f(t, i)
+    assert f(np.zeros(0), np.zeros(0, dtype="int64")) == 0
+
+
 def test_shared_gather_fuses_into_each_client():
     # matrix factorization: U[i] and V[j] feed the prediction and both gradients
     U, V, y = pt.matrix("U"), pt.matrix("V"), pt.vector("y")
