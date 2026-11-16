@@ -438,7 +438,8 @@ fn for_each_offset(shape: &[i64], strides: &[i64], mut f: impl FnMut(isize)) {
     }
 }
 
-/// Copy elements between two arrays of the same shape.
+/// Copy elements between two arrays of the same shape: the trailing axes both hold
+/// packed are copied as one block (whole rows, or everything at once).
 ///
 /// # Safety
 /// Both describe valid memory of `shape` with their strides; they don't overlap.
@@ -453,15 +454,13 @@ unsafe fn copy_strided(
     if shape.contains(&0) {
         return;
     }
-    if is_c_contiguous(shape, src_strides, itemsize)
-        && is_c_contiguous(shape, dst_strides, itemsize)
+    let (mut block, mut nd) = (itemsize as i64, shape.len());
+    while nd > 0
+        && (shape[nd - 1] == 1 || (src_strides[nd - 1] == block && dst_strides[nd - 1] == block))
     {
-        let n = shape.iter().product::<i64>() as usize * itemsize;
-        // SAFETY: both are `n` adjacent bytes (the function's contract).
-        unsafe { std::ptr::copy_nonoverlapping(src, dst, n) };
-        return;
+        block *= shape[nd - 1];
+        nd -= 1;
     }
-    let nd = shape.len();
     let mut idx = vec![0i64; nd];
     loop {
         let (mut so, mut d) = (0isize, 0isize);
@@ -469,8 +468,9 @@ unsafe fn copy_strided(
             so += (idx[a] * src_strides[a]) as isize;
             d += (idx[a] * dst_strides[a]) as isize;
         }
-        // SAFETY: the offsets stay inside both arrays (index < shape on every axis).
-        unsafe { std::ptr::copy_nonoverlapping(src.offset(so), dst.offset(d), itemsize) };
+        // SAFETY: the offsets stay inside both arrays (index < shape on every axis), and
+        // so does the block: both arrays are packed over the trailing axes.
+        unsafe { std::ptr::copy_nonoverlapping(src.offset(so), dst.offset(d), block as usize) };
         let mut a = nd;
         loop {
             if a == 0 {
