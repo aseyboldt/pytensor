@@ -373,6 +373,8 @@ def emit_fused(op, node, cg, inputs, outputs):
                 continue
             p = ptr_in[j]
             for r in reads[j] or []:
+                if id(r) in lifted:
+                    continue
                 ix = checked(
                     index_value(r.index, loop_index), x.shape[r.axis], "read", r.index
                 )
@@ -414,6 +416,7 @@ def emit_fused(op, node, cg, inputs, outputs):
                 r.index,
             )
             for r in spec.reads
+            if id(r) not in lifted
         ]
         if run is not None:
             return inc_run(i, d, base, ixs[0], v, *run)
@@ -424,7 +427,8 @@ def emit_fused(op, node, cg, inputs, outputs):
 
     def element(i, base, *ixs):
         res_arr = out_arrays[i][0]
-        for r, ix in zip(outs[i].reads, ixs, strict=True):
+        rs = [r for r in outs[i].reads if id(r) not in lifted]
+        for r, ix in zip(rs, ixs, strict=True):
             base = advance(b, base, ix, res_arr.strides[r.axis], res_arr.dtype)
         return base
 
@@ -478,6 +482,33 @@ def emit_fused(op, node, cg, inputs, outputs):
 
     writes = [i for i in out_keys if isinstance(outs[i], Write)]
 
+    # an index read along outer loop axes only moves its pointer once per iteration of
+    # the last of them, not per element: the loop over the last axis stays a stream
+    hoisted = {}  # outer axis (-1: before the loops) -> [(array position, Read, array, what)]
+    for pos, (rs, arr, what) in enumerate(
+        [(reads[j], inputs[j], "read") for j in in_keys]
+        + [
+            (
+                outs[i].reads if i in writes and i not in inner_inc else None,
+                out_arrays[i][0],
+                "write",
+            )
+            for i in out_keys
+        ]
+    ):
+        for r in rs or []:
+            if nd - 1 not in idx_axes[r.index]:
+                hoisted.setdefault(max(idx_axes[r.index], default=-1), []).append(
+                    (pos, r, arr, what)
+                )
+    lifted = {id(r) for rs in hoisted.values() for _, r, _, _ in rs}
+
+    def lift(a, ptrs, index):
+        for pos, r, arr, what in hoisted.get(a, []):
+            ix = checked(index_value(r.index, index), arr.shape[r.axis], what, r.index)
+            ptrs[pos] = advance(b, ptrs[pos], ix, arr.strides[r.axis], arr.dtype)
+        return ptrs
+
     def innermost(a, ptrs, index):
         """The loop over the last axis: reductions over it in registers; values written
         through indices go in chunks, computed by a loop that vectorizes, then written."""
@@ -516,32 +547,33 @@ def emit_fused(op, node, cg, inputs, outputs):
                 lambda j, *accs: compute(b.add(start, j), accs, defer(j))[0],
             )
 
-            def scatter(j, *carried):
-                i = b.add(start, j)
-                _, qo = at(i)
-                new = []
-                for k in writes:
-                    v = load(b, out_dtypes[k], buffer(k, j))
-                    if k in inner_inc:
-                        n_ = inner_inc.index(k)
-                        new += write(
-                            k, qo[k], [*index, i], v, carried[2 * n_ : 2 * n_ + 2]
-                        )
-                    else:
-                        write(k, qo[k], [*index, i], v)
-                return new
+            # one loop per output: each a single stream of writes, which vectorizes
+            for k in writes:
 
-            runs = [
-                x for k in inner_inc for x in (b.i64(-1), constant(b, out_dtypes[k], 0))
-            ]
-            runs = b.fold(m, runs, scatter)
-            for n_, k in enumerate(inner_inc):
-                flush_run(k, out_dtypes[k], po[k], *runs[2 * n_ : 2 * n_ + 2])
+                def scatter(j, *run, k=k):
+                    i = b.add(start, j)
+                    v = load(b, out_dtypes[k], buffer(k, j))
+                    new = write(k, at(i)[1][k], [*index, i], v, run or None)
+                    return list(new) if run else []
+
+                run = (
+                    [b.i64(-1), constant(b, out_dtypes[k], 0)] if k in inner_inc else []
+                )
+                run = b.fold(m, run, scatter)
+                if k in inner_inc:
+                    flush_run(k, out_dtypes[k], po[k], *run)
             return accs
 
         init = [load(b, outs[i].acc, po[i]) for i in inner_red]
         if writes:
-            bufs = {k: b.alloca(memory_type(out_dtypes[k]), CHUNK) for k in writes}
+            # outputs of one scalar value (a value written to several targets) share one
+            scalar_outs = getattr(E.op.scalar_op, "outputs", None)
+            same, bufs = {}, {}
+            for k in writes:
+                key = (id(scalar_outs[k]) if scalar_outs else k, out_dtypes[k])
+                if key not in same:
+                    same[key] = b.alloca(memory_type(out_dtypes[k]), CHUNK)
+                bufs[k] = same[key]
             n = shape[a]
             n_chunks = b.sdiv(b.add(n, b.i64(CHUNK - 1)), b.i64(CHUNK))
             final = b.fold(n_chunks, init, chunk)
@@ -564,9 +596,9 @@ def emit_fused(op, node, cg, inputs, outputs):
                     advance(b, p, i, arr.strides[a], arr.dtype)
                     for p, arr in zip(ptrs, arrays, strict=True)
                 ]
-                level(a + 1, q, [*index, i])
+                level(a + 1, lift(a, q, [*index, i]), [*index, i])
 
-        level(0, [arr.data for arr in arrays], [])
+        level(0, lift(-1, [arr.data for arr in arrays], []), [])
         return []
 
     # one flat loop when nothing is indexed, every reduction reduces everything, and the
