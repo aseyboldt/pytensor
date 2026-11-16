@@ -962,3 +962,34 @@ class FuseElemwise(GraphRewriter):
 fused_elemwise_optdb.register(
     "fuse_elemwise", FuseElemwise(), "numba", "llvm", position=0
 )
+
+
+class SplitSharedGather(GraphRewriter):
+    """Give each Elemwise client of a fusable gather its own copy, so every copy fuses as an indexed read."""
+
+    def apply(self, fgraph):
+        for node in fgraph.toposort():
+            clients = fgraph.clients.get(node.outputs[0], [])
+            if (
+                len(clients) < 2
+                or FuseElemwise._extract_idx_axis_pairs(node) is None
+                or not all(
+                    isinstance(c.op, Elemwise)
+                    and not all(all(i.type.broadcastable) for i in c.inputs)
+                    for c, _ in clients
+                )
+            ):
+                continue
+            for c, i in clients[1:]:
+                fgraph.change_node_input(
+                    c, i, node.clone().outputs[0], reason="split_shared_gather"
+                )
+
+
+fused_elemwise_optdb.register(
+    "llvm_split_shared_gather",
+    SplitSharedGather(),
+    "llvm",
+    position=-0.7,
+    use_db_name_as_tag=False,
+)

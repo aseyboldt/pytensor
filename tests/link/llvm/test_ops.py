@@ -214,6 +214,16 @@ def test_assert():
         f(-np.ones(3))
 
 
+def test_dot_mixed_dtypes():
+    # operands are cast to the output dtype (llvm_dot_upcast): no numba fallback
+    a, v = pt.lmatrix("a"), pt.dvector("v")
+    compare(
+        [a, v],
+        [pt.dot(a, v), pt.dot(v[:3], a)],
+        [np.arange(12).reshape(3, 4), np.linspace(0, 1, 4)],
+    )
+
+
 @pytest.mark.parametrize("axis", [0, 1, -1])
 @pytest.mark.parametrize("op", [pt.cumsum, pt.cumprod])
 def test_cumop(op, axis):
@@ -457,6 +467,30 @@ def test_fused_elemwise_indexed_increments():
     f = pytensor.function([x, y], outs(pt.as_tensor(const_idx + 5)), mode=LLVM)
     with pytest.raises(Exception, match="FusedElemwise: index out of bounds"):
         f(rng.random(5), rng.random(10))
+
+
+def test_fused_reads_share_source():
+    # one table read through several index arrays stays one fused loop
+    tab, idx = pt.matrix("tab"), pt.lvector("idx")
+    out = (tab[idx] + tab[idx % 7] + tab[idx % 3]).sum()
+    f = compare([tab, idx], out, [rng.random((35, 5)), rng.integers(0, 35, 100)])
+    assert not any(s.startswith("AdvancedSubtensor") for s in tasks(f))
+
+
+def test_shared_gather_fuses_into_each_client():
+    # matrix factorization: U[i] and V[j] feed the prediction and both gradients
+    U, V, y = pt.matrix("U"), pt.matrix("V"), pt.vector("y")
+    i, j = pt.lvector("i"), pt.lvector("j")
+    loss = ((y - (U[i] * V[j]).sum(1)) ** 2).sum()
+    vals = [
+        rng.random((7, 3)),
+        rng.random((5, 3)),
+        rng.random(40),
+        rng.integers(0, 7, 40),
+        rng.integers(0, 5, 40),
+    ]
+    f = compare([U, V, y, i, j], [loss, *pytensor.grad(loss, [U, V])], vals)
+    assert not any(s.startswith("AdvancedSubtensor") for s in tasks(f))
 
 
 def test_scan_sit_sot_mit_sot_nit_sot():
