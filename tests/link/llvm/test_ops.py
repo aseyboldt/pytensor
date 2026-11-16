@@ -493,6 +493,35 @@ def test_fused_reads_share_source():
     assert not any(s.startswith("AdvancedSubtensor") for s in tasks(f))
 
 
+def test_fused_multi_axis_indices():
+    # several index arrays per subscript, broadcasting N-d indices, reads and increments
+    x, B, t = pt.matrix("x"), pt.matrix("B"), pt.tensor3("t")
+    i, j, k = pt.lvector("i"), pt.lvector("j"), pt.lscalar("k")
+    K = B[i[:, None], j[None, :]] * pt.exp(x)
+    outs = [
+        (x[i, j] * 2).sum(),
+        K.sum(),
+        K.sum(axis=0),
+        K.sum(axis=1),
+        pt.inc_subtensor(pt.zeros_like(B)[i[:, None], j[None, :]], pt.exp(x)),
+        (pt.log(t[:, i, j]) + 1).sum(axis=0),
+        pt.exp(x[i.reshape((2, 3))]).sum(axis=0),
+        pt.exp(x[k, j]).sum() + pt.exp(x[j, k] * 2),
+    ]
+    vals = [
+        rng.random((6, 6)),
+        rng.random((5, 5)),
+        rng.random((3, 5, 5)) + 0.5,
+        np.array([0, 4, -1, 2, 2, 1]),
+        np.array([1, 1, 3, 0, -5, 4]),
+        np.array(-2),
+    ]
+    f = compare([x, B, t, i, j, k], outs, vals)
+    assert not any(s.startswith(("Advanced", "Sum")) for s in tasks(f))
+    with pytest.raises(Exception, match="index out of bounds"):
+        f(*vals[:3], vals[3] + 6, *vals[4:])
+
+
 def test_shared_gather_fuses_into_each_client():
     # matrix factorization: U[i] and V[j] feed the prediction and both gradients
     U, V, y = pt.matrix("U"), pt.matrix("V"), pt.vector("y")

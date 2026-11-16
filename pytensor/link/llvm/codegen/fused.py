@@ -2,9 +2,10 @@
 reductions (see pytensor.tensor.rewriting.fused_elemwise).
 
 Outer inputs are `[elemwise inputs..., index arrays..., write targets...]`. Each Elemwise
-input is plain (broadcast by its type) or read through a 1-d index array along one axis.
-Each output is plain, a reduction over some loop axes, or written through an index into
-a copy of its target (inc or set). Patterns outside this raise NotImplementedError and
+input is plain (broadcast by its type) or read through integer index arrays on consecutive
+axes, which broadcast together (as in numpy) over loop axes of their own. Each output is
+plain, a reduction over some loop axes, or written through such indices into a copy of
+its target (inc or set). Patterns outside this raise NotImplementedError and
 the planner runs the inner graph node by node instead.
 """
 
@@ -35,7 +36,7 @@ from pytensor.link.llvm.codegen.emit import (
 from pytensor.link.llvm.codegen.function import llvm_emit
 from pytensor.link.llvm.codegen.scalar import emit_scalar
 from pytensor.link.llvm.codegen.types import check_dtype
-from pytensor.link.llvm.layout import Layout
+from pytensor.link.llvm.layout import DYNAMIC, Layout
 from pytensor.scalar.basic import ScalarType, add
 from pytensor.tensor.elemwise import Elemwise
 from pytensor.tensor.subtensor import AdvancedSubtensor
@@ -49,8 +50,7 @@ class Read:
 
 @dataclass
 class Write:
-    index: int
-    axis: int
+    reads: list  # [Read]: the index arrays and the target axes they index
     target: int  # outer input position of the target
     set: bool
 
@@ -64,6 +64,8 @@ class Reduce:
 
 
 def fused_spec(op, node):
+    """(the Elemwise, its number of inputs, per input its `Read`s or None, per output
+    its `Reduce`/`Write` or None, the loop axes of each index array)."""
     inner = op.fgraph
     elems = [n for n in inner.apply_nodes if isinstance(n.op, Elemwise)]
     if len(elems) != 1:
@@ -72,30 +74,24 @@ def fused_spec(op, node):
     n_idx = len(op.indexed_inputs)
     if len(op.indexed_outputs) not in (0, n_idx):
         raise NotImplementedError("FusedElemwise: inconsistent index specs")
-    written = sorted(int(s) for e in op.indexed_outputs if e is not None for s in e[0])
+    written = sorted(
+        {int(s) for e in op.indexed_outputs if e is not None for s in e[0]}
+    )
     n_elem = len(node.inputs) - n_idx - len(written)
     if len(E.inputs) != n_elem or len(E.outputs) != len(node.outputs):
         raise NotImplementedError("FusedElemwise: unexpected inner structure")
-
-    def check_index(p):
-        t = node.inputs[p].type
-        if t.ndim != 1 or not t.dtype.startswith(("int", "uint")):
+    for k in range(n_idx):
+        t = node.inputs[n_elem + k].type
+        if not t.dtype.startswith(("int", "uint")):
             raise NotImplementedError(
-                "FusedElemwise: only 1-d integer index arrays are fused"
+                "FusedElemwise: only integer index arrays are fused"
             )
 
     reads = [None] * n_elem
     for k, entry in enumerate(op.indexed_inputs):
-        if entry is None:
-            continue
-        sources, axis = entry
-        check_index(n_elem + k)
-        for s in sources:
-            if reads[s] is not None:
-                raise NotImplementedError(
-                    "FusedElemwise: a source read through several indices"
-                )
-            reads[s] = Read(n_elem + k, int(axis))
+        if entry is not None:
+            for s in entry[0]:
+                reads[s] = [*(reads[s] or []), Read(n_elem + k, int(entry[1]))]
 
     def is_input(v, j):
         # inner inputs fed by one outer variable are merged (a table read through several indices)
@@ -130,24 +126,65 @@ def fused_spec(op, node):
         if entry is None:
             continue
         sources, axis, mode = entry
-        check_index(n_elem + k)
         for s in sources:
-            if outs[s] is not None:
+            if isinstance(outs[s], Reduce):
                 raise NotImplementedError(
-                    "FusedElemwise: an output written through several indices"
+                    "FusedElemwise: a reduction written through an index"
                 )
-            outs[s] = Write(
-                n_elem + k,
-                int(axis),
-                n_elem + n_idx + written.index(int(s)),
-                mode == "set",
-            )
+            if outs[s] is None:
+                target = n_elem + n_idx + written.index(int(s))
+                outs[s] = Write([], target, mode == "set")
+            elif outs[s].set != (mode == "set"):
+                raise NotImplementedError("FusedElemwise: mixed inc and set")
+            outs[s].reads.append(Read(n_elem + k, int(axis)))
     for i, o in enumerate(node.outputs):
         if o.type.dtype != E.outputs[i].type.dtype:
             raise NotImplementedError(
                 "FusedElemwise: output dtype differs from the loop's"
             )
-    return E, n_elem, reads, outs
+    groups = [r for r in reads if r] + [o.reads for o in outs if isinstance(o, Write)]
+    for g in groups:
+        axes = sorted(r.axis for r in g)
+        if axes != list(range(axes[0], axes[0] + len(g))):
+            raise NotImplementedError("FusedElemwise: indices on non-consecutive axes")
+    idx_axes = index_axes(node, n_elem, n_idx, groups)
+    for g in groups:
+        end = min(r.axis for r in g) + max(node.inputs[r.index].type.ndim for r in g)
+        if any(idx_axes[r.index][-1:] not in ((), (end - 1,)) for r in g):
+            raise NotImplementedError(
+                "FusedElemwise: an index shared by unlike subscripts"
+            )
+    return E, n_elem, reads, outs, idx_axes
+
+
+def index_axes(node, n_elem, n_idx, groups):
+    """The loop axes each index array is read along (as numpy broadcasts the indices of
+    one subscript: right-aligned over a span starting at the first indexed axis). Index
+    arrays shared by several subscripts span the union, as in the numba backend."""
+    parent = list(range(n_idx))
+
+    def find(x):
+        while parent[x] != x:
+            x = parent[x]
+        return x
+
+    for g in groups:
+        for r in g[1:]:
+            a, c = find(g[0].index - n_elem), find(r.index - n_elem)
+            parent[a] = c
+    start, width = {}, {}
+    for g in groups:
+        for r in g:
+            k = find(r.index - n_elem)
+            start[k] = min(start.get(k, r.axis), r.axis)
+            width[k] = max(width.get(k, 0), node.inputs[r.index].type.ndim)
+    axes = {}
+    for k in range(n_idx):
+        root, nd = find(k), node.inputs[n_elem + k].type.ndim
+        if root in start:
+            end = start[root] + width[root]
+            axes[n_elem + k] = tuple(range(end - nd, end))
+    return axes
 
 
 def _register():
@@ -160,32 +197,50 @@ def _register():
 
 def emit_fused(op, node, cg, inputs, outputs):
     b = cg.b
-    E, n_elem, reads, outs = fused_spec(op, node)
+    E, n_elem, reads, outs, idx_axes = fused_spec(op, node)
     nd = E.outputs[0].type.ndim
     in_dtypes = [check_dtype(v.type.dtype) for v in E.inputs]
     out_dtypes = [check_dtype(v.type.dtype) for v in E.outputs]
 
+    def axis_map(ndim, rs):
+        """The loop axis of each axis of an array read or written through `rs` (None:
+        stepped by its index)."""
+        if not rs:
+            return list(range(ndim))
+        a0, m = min(r.axis for r in rs), len(rs)
+        end = a0 + max(node.inputs[r.index].type.ndim for r in rs)
+        return [
+            d if d < a0 else None if d < a0 + m else d - a0 - m + end
+            for d in range(ndim)
+        ]
+
     # ---- the loop shape, from everything that has lengths
     lengths = [[] for _ in range(nd)]  # candidates per axis: (value, what)
     static = list(E.outputs[0].type.shape)
+
+    def index_lengths(rs):
+        for r in rs:
+            st = node.inputs[r.index].type.shape
+            for t, a in enumerate(idx_axes[r.index]):
+                if st[t] != 1:
+                    lengths[a].append(inputs[r.index].shape[t])
+
     for j in range(n_elem):
         x = inputs[j]
         if not isinstance(x, Array):
             continue  # a scalar
-        r = reads[j]
         etype = E.inputs[j].type
-        for a in range(nd):
-            if r is not None and a == r.axis:
-                lengths[a].append(inputs[r.index].shape[0])
-            elif etype.shape[a] != 1:
-                lengths[a].append(x.shape[a])
+        for d, a in enumerate(axis_map(x.ndim, reads[j])):
+            if a is not None and etype.shape[a] != 1:
+                lengths[a].append(x.shape[d])
+        index_lengths(reads[j] or [])
     for i, spec in enumerate(outs):
         if isinstance(spec, Write):
             t = inputs[spec.target]
-            for a in range(nd):
-                lengths[a].append(
-                    inputs[spec.index].shape[0] if a == spec.axis else t.shape[a]
-                )
+            for d, a in enumerate(axis_map(t.ndim, spec.reads)):
+                if a is not None:
+                    lengths[a].append(t.shape[d])
+            index_lengths(spec.reads)
     shape = []
     for a in range(nd):
         cand = lengths[a]
@@ -241,22 +296,27 @@ def emit_fused(op, node, cg, inputs, outputs):
         if reads[j] is None and all(s == 1 for s in E.inputs[j].type.shape):
             fixed[j] = load(b, x.dtype, x.data)
             continue
-        skip = reads[j].axis if reads[j] is not None else None
-        # (an indexed axis is stepped through by the index, not by the loop)
-        plain_in[j] = loop_view(b, x, shape, zero_axes=() if skip is None else (skip,))
+        if reads[j] is None:
+            plain_in[j] = loop_view(b, x, shape)
+        else:
+            plain_in[j] = mapped_view(b, x, shape, axis_map(x.ndim, reads[j]))
     plain_out = {}
     for i, spec in enumerate(outs):
         res, acc = out_arrays[i]
         if isinstance(spec, Reduce):
             plain_out[i] = reduced_view(b, acc, shape, spec.axes)
         elif isinstance(spec, Write):
-            plain_out[i] = loop_view(b, res, shape, zero_axes=(spec.axis,))
+            plain_out[i] = mapped_view(b, res, shape, axis_map(res.ndim, spec.reads))
         else:
             plain_out[i] = Array(res.dtype, res.data, shape, res.strides)
 
-    def index_value(k, i):
-        """idx[i] for index array input k, wrapped and bounds-checked against `n`."""
-        return inputs[k].load(b, i).astype("int64").value
+    def index_value(k, loop_index):
+        """The element of index array input k at the loop position (unwrapped)."""
+        st = node.inputs[k].type.shape
+        at = [
+            b.i64(0) if st[t] == 1 else loop_index[a] for t, a in enumerate(idx_axes[k])
+        ]
+        return inputs[k].load(b, *at).astype("int64").value
 
     def checked(v, n, what, k):
         return checked_index(
@@ -284,11 +344,9 @@ def emit_fused(op, node, cg, inputs, outputs):
                 args.append((cast(b, fixed[j], x.dtype, d), d))
                 continue
             p = ptr_in[j]
-            r = reads[j]
-            if r is not None:
-                n = x.shape[r.axis]
+            for r in reads[j] or []:
                 ix = checked(
-                    index_value(r.index, loop_index[r.axis]), n, "read", r.index
+                    index_value(r.index, loop_index), x.shape[r.axis], "read", r.index
                 )
                 p = advance(b, p, ix, x.strides[r.axis], x.dtype)
             args.append((load(b, x.dtype, p), d))
@@ -310,17 +368,19 @@ def emit_fused(op, node, cg, inputs, outputs):
                     store(b, spec.acc, new, ptr_out[i])
             elif isinstance(spec, Write):
                 res_arr = out_arrays[i][0]
-                n = res_arr.shape[spec.axis]
-                ix = checked(
-                    index_value(spec.index, loop_index[spec.axis]),
-                    n,
-                    "write",
-                    spec.index,
-                )
+                ixs = [
+                    checked(
+                        index_value(r.index, loop_index),
+                        res_arr.shape[r.axis],
+                        "write",
+                        r.index,
+                    )
+                    for r in spec.reads
+                ]
                 if i in runs:
-                    new_runs[i] = inc_run(i, d, ptr_out[i], ix, v, *runs[i])
+                    new_runs[i] = inc_run(i, d, ptr_out[i], ixs[0], v, *runs[i])
                     continue
-                p = element(i, ptr_out[i], ix)
+                p = element(i, ptr_out[i], *ixs)
                 if not spec.set:
                     v = emit_scalar(add, b, [(load(b, d, p), d), (v, d)], [d])[0]
                 store(b, d, v, p)
@@ -328,9 +388,11 @@ def emit_fused(op, node, cg, inputs, outputs):
                 store(b, d, v, ptr_out[i])
         return new_accs, new_runs
 
-    def element(i, base, ix):
+    def element(i, base, *ixs):
         res_arr = out_arrays[i][0]
-        return advance(b, base, ix, res_arr.strides[outs[i].axis], res_arr.dtype)
+        for r, ix in zip(outs[i].reads, ixs, strict=True):
+            base = advance(b, base, ix, res_arr.strides[r.axis], res_arr.dtype)
+        return base
 
     def inc_run(i, d, base, ix, v, prev, cur):
         """`out[ix] += v` with the element being incremented kept in a register while
@@ -356,9 +418,7 @@ def emit_fused(op, node, cg, inputs, outputs):
     in_keys = sorted(plain_in)
     out_keys = sorted(plain_out)
     arrays = [plain_in[j] for j in in_keys] + [plain_out[i] for i in out_keys]
-    any_indexed = any(r is not None for r in reads) or any(
-        isinstance(s, Write) for s in outs
-    )
+    any_indexed = any(reads) or any(isinstance(s, Write) for s in outs)
 
     def split(ptrs):
         return dict(zip(in_keys, ptrs[: len(in_keys)], strict=True)), dict(
@@ -371,11 +431,15 @@ def emit_fused(op, node, cg, inputs, outputs):
         for i, s in enumerate(outs)
         if isinstance(s, Reduce) and nd > 0 and (nd - 1) in s.axes
     ]
-    # increments through an index along the innermost axis keep their run in registers
+    # increments through one index along the innermost axis keep their run in registers
     inner_inc = [
         i
         for i, s in enumerate(outs)
-        if isinstance(s, Write) and not s.set and nd > 0 and s.axis == nd - 1
+        if isinstance(s, Write)
+        and not s.set
+        and nd > 0
+        and len(s.reads) == 1
+        and idx_axes[s.reads[0].index] == (nd - 1,)
     ]
 
     def nest():
@@ -491,6 +555,23 @@ def emit_fused(op, node, cg, inputs, outputs):
     else:
         b.if_else(contig, flat, nest)
     _finish(cg, outs, out_arrays, scalar_outs)
+
+
+def mapped_view(b, a: Array, shape, axes) -> Array:
+    """`a` iterated over the loop `shape`, its axis d along loop axis `axes[d]` (None:
+    not by the loop); loop axes no axis of `a` (or a broadcast one) runs along get stride 0."""
+    nd, static = len(shape), a.static_shape()
+    strides, kinds = [b.i64(0)] * nd, [0] * nd
+    for d, ax in enumerate(axes):
+        if ax is not None and not (static[d] == 1 and shape[ax].const_int != 1):
+            strides[ax], kinds[ax] = a.strides[d], DYNAMIC
+    return Array(
+        a.dtype,
+        a.data,
+        list(shape),
+        strides,
+        Layout.make([n.const_int for n in shape], range(nd), kinds),
+    )
 
 
 def reduced_view(b, acc: Array, shape, axes) -> Array:
