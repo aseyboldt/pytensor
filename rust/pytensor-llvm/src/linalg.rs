@@ -46,7 +46,7 @@ pub trait Float:
     fn from_f64(x: f64) -> Self;
 
     /// `self + a * b`, fused when the caller was compiled with FMA (see
-    /// `gemv_short_rows`).
+    /// `gemv_rows`).
     fn madd<const FMA: bool>(self, a: Self, b: Self) -> Self;
 }
 
@@ -206,9 +206,6 @@ impl<T: Float> FaerKernel for Dot<T> {
     }
 }
 
-/// Rows up to this length go through `gemv_short_rows`; longer ones through faer.
-const SHORT_ROW: usize = 64;
-
 /// `out = a b`, with `a` a matrix or a row, `b` a matrix or a column, `out` of the
 /// product's shape (a vector result is a row if `out_as_row`).
 fn matmul<T: Float>(
@@ -235,9 +232,9 @@ fn matmul<T: Float>(
     };
     if let Some((matrix, x, y)) = gemv {
         let (rows, k) = (matrix.nrows(), matrix.ncols());
-        // contiguous short rows (X @ beta with X row-major), where general kernels
-        // do poorly
-        if matrix.col_stride() == 1 && k <= SHORT_ROW && rows >= 4 {
+        // contiguous rows (X @ beta with X row-major): faer's kernels reach about half
+        // the memory bandwidth here
+        if matrix.col_stride() == 1 && rows >= 4 {
             let x = if x.row_stride() == 1 {
                 x.as_ptr()
             } else {
@@ -252,7 +249,7 @@ fn matmul<T: Float>(
             // own, or the copy just made); `y` has `rows` elements `row_stride`
             // apart, ours to write.
             unsafe {
-                simd::gemv_short_rows(
+                simd::gemv_rows(
                     rows,
                     k,
                     matrix.as_ptr(),
@@ -294,11 +291,10 @@ mod simd {
 
     use super::Float;
 
-    /// y = A x for A with contiguous, short rows (k small), where general gemv kernels do
-    /// poorly: 4 rows at a time, 4 independent lanes along each row (so LLVM vectorizes
-    /// without reassociating), x contiguous.
+    /// y = A x for A with contiguous rows: `R` rows at a time, `L` independent lanes
+    /// along each row (so LLVM vectorizes without reassociating), x contiguous.
     #[inline(always)]
-    unsafe fn gemv_short_rows_impl<T: Float, const FMA: bool>(
+    unsafe fn gemv_rows_impl<T: Float, const FMA: bool, const R: usize, const L: usize>(
         m: usize,
         k: usize,
         a: *const T,
@@ -307,29 +303,36 @@ mod simd {
         y: *mut T,
         incy: isize,
     ) {
-        const L: usize = 4;
         let kl = k - k % L;
         let mut i = 0;
-        while i + 4 <= m {
-            let rows = [0, 1, 2, 3].map(|r| a.offset((i + r) as isize * rsa));
-            let mut acc = [[T::default(); L]; 4];
+        while i + R <= m {
+            let rows: [*const T; R] = std::array::from_fn(|r| a.offset((i + r) as isize * rsa));
+            let mut acc = [[T::default(); L]; R];
             let mut j = 0;
             while j < kl {
-                for r in 0..4 {
+                for r in 0..R {
                     for l in 0..L {
                         acc[r][l] = acc[r][l].madd::<FMA>(*rows[r].add(j + l), *x.add(j + l));
                     }
                 }
                 j += L;
             }
-            for r in 0..4 {
-                let mut s = (acc[r][0] + acc[r][1]) + (acc[r][2] + acc[r][3]);
+            for r in 0..R {
+                // pairwise, as the lanes were vectorized
+                let mut w = L;
+                while w > 1 {
+                    w /= 2;
+                    for l in 0..w {
+                        acc[r][l] = acc[r][l] + acc[r][l + w];
+                    }
+                }
+                let mut s = acc[r][0];
                 for j in kl..k {
                     s = s.madd::<FMA>(*rows[r].add(j), *x.add(j));
                 }
                 *y.offset((i + r) as isize * incy) = s;
             }
-            i += 4;
+            i += R;
         }
         while i < m {
             let row = a.offset(i as isize * rsa);
@@ -344,7 +347,7 @@ mod simd {
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2,fma")]
-    unsafe fn gemv_short_rows_avx2<T: Float>(
+    unsafe fn gemv_rows_avx2<T: Float>(
         m: usize,
         k: usize,
         a: *const T,
@@ -353,7 +356,11 @@ mod simd {
         y: *mut T,
         incy: isize,
     ) {
-        gemv_short_rows_impl::<T, true>(m, k, a, rsa, x, y, incy)
+        if k < 24 {
+            gemv_rows_impl::<T, true, 4, 4>(m, k, a, rsa, x, y, incy)
+        } else {
+            gemv_rows_impl::<T, true, 2, 8>(m, k, a, rsa, x, y, incy)
+        }
     }
 
     /// y = A x for A with contiguous columns, 4 columns at a time (y stays in cache).
@@ -437,7 +444,7 @@ mod simd {
     ///
     /// # Safety
     /// The pointers are valid for those elements, and `y` overlaps neither `A` nor `x`.
-    pub unsafe fn gemv_short_rows<T: Float>(
+    pub unsafe fn gemv_rows<T: Float>(
         m: usize,
         k: usize,
         a: *const T,
@@ -449,10 +456,10 @@ mod simd {
         #[cfg(target_arch = "x86_64")]
         {
             if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
-                return gemv_short_rows_avx2(m, k, a, rsa, x, y, incy);
+                return gemv_rows_avx2(m, k, a, rsa, x, y, incy);
             }
         }
-        gemv_short_rows_impl::<T, false>(m, k, a, rsa, x, y, incy)
+        gemv_rows_impl::<T, false, 4, 4>(m, k, a, rsa, x, y, incy)
     }
 }
 

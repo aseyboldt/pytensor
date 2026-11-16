@@ -224,12 +224,13 @@ def test_dot_mixed_dtypes():
     )
 
 
-def test_dot_of_contiguous_columns():
-    # A^T v with A row-major: column kernel, with a tail of columns and a strided v
+def test_matrix_vector_kernels():
+    # rows (short and long, odd counts, tails) and columns (A^T v), strided vectors
     a, v = pt.matrix("a"), pt.vector("v")
-    m, x = rng.normal(size=(7, 30)), rng.normal(size=14)
+    m, x = rng.normal(size=(7, 30)), rng.normal(size=60)
     m[3, 5] = np.inf
-    compare([a, v], [a.T @ v[::2], v[:7] @ a], [m, x])
+    outs = [a.T @ v[:14:2], v[:7] @ a, a @ v[:30], a @ v[::2], a[:, :5] @ v[:5]]
+    compare([a, v], outs, [m, x])
 
 
 @pytest.mark.parametrize("axis", [0, 1, -1])
