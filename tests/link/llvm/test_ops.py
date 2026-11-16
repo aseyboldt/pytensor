@@ -523,6 +523,28 @@ def test_fused_multi_axis_indices():
         f(*vals[:3], vals[3] + 6, *vals[4:])
 
 
+def test_fused_writes_in_chunks():
+    # past one chunk: runs of an index across chunk ends, random increments, sets, and
+    # a reduction computed in the same loop
+    x, y = pt.vector("x"), pt.vector("y")
+    i, j = pt.lvector("i"), pt.lvector("j")
+    v = pt.exp(y) * 2
+    outs = [
+        pt.inc_subtensor(x[i], v),
+        pt.inc_subtensor(x[j], v * y),
+        pt.set_subtensor(x[j], y),
+        v.sum(),
+    ]
+    vals = [
+        rng.random(9),
+        rng.random(300),
+        np.repeat(np.arange(-3, 6), [10, 100, 30, 1, 120, 9, 10, 15, 5]),
+        rng.integers(-9, 9, 300),
+    ]
+    f = compare([x, y, i, j], outs, vals)
+    assert any(s.startswith("FusedElemwise") and "reduce" in s for s in tasks(f))
+
+
 def test_fused_index_checks_dont_branch():
     # bad indices fail after the loop, which vectorizes; an empty table fails before it
     tab, idx = pt.vector("tab"), pt.lvector("idx")

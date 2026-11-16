@@ -42,6 +42,10 @@ from pytensor.tensor.elemwise import Elemwise
 from pytensor.tensor.subtensor import AdvancedSubtensor
 
 
+#: elements of the last axis whose values to write are computed, then written, at once
+CHUNK = 128
+
+
 @dataclass
 class Read:
     index: int  # outer input position of the index array
@@ -350,11 +354,12 @@ def emit_fused(op, node, cg, inputs, outputs):
         for flag, msg in flags.values():
             cg.check(b.eq(b.load(ir.i8, flag), constant(b, "int8", 0)), msg)
 
-    def body(ptr_in, ptr_out, loop_index, accs, runs=None):
+    def body(ptr_in, ptr_out, loop_index, accs, runs=None, defer=None):
         """One element. `ptr_in[j]`/`ptr_out[i]`: element pointers of the plain parts;
         `accs`: register accumulators {output: value}; `runs`: {output: (index, value)}
-        of the incremented element of an output kept in registers (see `inc_run`).
-        Returns the new accumulators and runs."""
+        of the incremented element of an output kept in registers (see `inc_run`);
+        `defer`: {output: where to store its value instead of writing it through the
+        index}. Returns the new accumulators and runs."""
         runs = runs or {}
         new_runs = {}
         args = []
@@ -389,27 +394,33 @@ def emit_fused(op, node, cg, inputs, outputs):
                     new_accs[i] = new
                 else:
                     store(b, spec.acc, new, ptr_out[i])
+            elif defer and i in defer:
+                store(b, d, v, defer[i])
             elif isinstance(spec, Write):
-                res_arr = out_arrays[i][0]
-                ixs = [
-                    checked(
-                        index_value(r.index, loop_index),
-                        res_arr.shape[r.axis],
-                        "write",
-                        r.index,
-                    )
-                    for r in spec.reads
-                ]
-                if i in runs:
-                    new_runs[i] = inc_run(i, d, ptr_out[i], ixs[0], v, *runs[i])
-                    continue
-                p = element(i, ptr_out[i], *ixs)
-                if not spec.set:
-                    v = emit_scalar(add, b, [(load(b, d, p), d), (v, d)], [d])[0]
-                store(b, d, v, p)
+                new_runs[i] = write(i, ptr_out[i], loop_index, v, runs.get(i))
             else:
                 store(b, d, v, ptr_out[i])
         return new_accs, new_runs
+
+    def write(i, base, loop_index, v, run=None):
+        """`v` written (inc or set) through the indices of output i; the new run if
+        `run` (see `inc_run`)."""
+        spec, res_arr, d = outs[i], out_arrays[i][0], out_dtypes[i]
+        ixs = [
+            checked(
+                index_value(r.index, loop_index),
+                res_arr.shape[r.axis],
+                "write",
+                r.index,
+            )
+            for r in spec.reads
+        ]
+        if run is not None:
+            return inc_run(i, d, base, ixs[0], v, *run)
+        p = element(i, base, *ixs)
+        if not spec.set:
+            v = emit_scalar(add, b, [(load(b, d, p), d), (v, d)], [d])[0]
+        store(b, d, v, p)
 
     def element(i, base, *ixs):
         res_arr = out_arrays[i][0]
@@ -465,44 +476,84 @@ def emit_fused(op, node, cg, inputs, outputs):
         and idx_axes[s.reads[0].index] == (nd - 1,)
     ]
 
+    writes = [i for i in out_keys if isinstance(outs[i], Write)]
+
+    def innermost(a, ptrs, index):
+        """The loop over the last axis: reductions over it in registers; values written
+        through indices go in chunks, computed by a loop that vectorizes, then written."""
+        _, po = split(ptrs)
+
+        def at(i):
+            return split(
+                [
+                    advance(b, p, i, arr.strides[a], arr.dtype)
+                    for p, arr in zip(ptrs, arrays, strict=True)
+                ]
+            )
+
+        def compute(i, accs, defer=None, runs=None):
+            qi, qo = at(i)
+            new, new_runs = body(
+                qi,
+                qo,
+                [*index, i],
+                dict(zip(inner_red, accs, strict=True)),
+                runs,
+                defer,
+            )
+            return [new[k] for k in inner_red], new_runs
+
+        def buffer(k, j):
+            return b.gep(memory_type(out_dtypes[k]), bufs[k], j)
+
+        def chunk(c, *accs):
+            start = b.mul(c, b.i64(CHUNK), nsw=True)
+            m = b.smin(b.sub(n, start, nsw=True), b.i64(CHUNK))
+            defer = lambda j: {k: buffer(k, j) for k in writes}  # noqa: E731
+            accs = b.fold(
+                m,
+                list(accs),
+                lambda j, *accs: compute(b.add(start, j), accs, defer(j))[0],
+            )
+
+            def scatter(j, *carried):
+                i = b.add(start, j)
+                _, qo = at(i)
+                new = []
+                for k in writes:
+                    v = load(b, out_dtypes[k], buffer(k, j))
+                    if k in inner_inc:
+                        n_ = inner_inc.index(k)
+                        new += write(
+                            k, qo[k], [*index, i], v, carried[2 * n_ : 2 * n_ + 2]
+                        )
+                    else:
+                        write(k, qo[k], [*index, i], v)
+                return new
+
+            runs = [
+                x for k in inner_inc for x in (b.i64(-1), constant(b, out_dtypes[k], 0))
+            ]
+            runs = b.fold(m, runs, scatter)
+            for n_, k in enumerate(inner_inc):
+                flush_run(k, out_dtypes[k], po[k], *runs[2 * n_ : 2 * n_ + 2])
+            return accs
+
+        init = [load(b, outs[i].acc, po[i]) for i in inner_red]
+        if writes:
+            bufs = {k: b.alloca(memory_type(out_dtypes[k]), CHUNK) for k in writes}
+            n = shape[a]
+            n_chunks = b.sdiv(b.add(n, b.i64(CHUNK - 1)), b.i64(CHUNK))
+            final = b.fold(n_chunks, init, chunk)
+        else:
+            final = b.fold(shape[a], init, lambda i, *accs: compute(i, accs)[0])
+        for i, v in zip(inner_red, final, strict=True):
+            store(b, outs[i].acc, v, po[i])
+
     def nest():
         def level(a, ptrs, index):
             if a == nd - 1 and nd > 0:
-                pi, po = split(ptrs)
-                init = [load(b, outs[i].acc, po[i]) for i in inner_red]
-                nr = len(inner_red)
-                for i in inner_inc:
-                    d = out_dtypes[i]
-                    init += [b.i64(-1), constant(b, d, 0)]
-
-                def step(i, *carried):
-                    q = [
-                        advance(b, p, i, arr.strides[a], arr.dtype)
-                        for p, arr in zip(ptrs, arrays, strict=True)
-                    ]
-                    qi, qo = split(q)
-                    runs = {
-                        k: carried[nr + 2 * n : nr + 2 * n + 2]
-                        for n, k in enumerate(inner_inc)
-                    }
-                    new, new_runs = body(
-                        qi,
-                        qo,
-                        [*index, i],
-                        dict(zip(inner_red, carried[:nr], strict=True)),
-                        runs,
-                    )
-                    return [new[k] for k in inner_red] + [
-                        v for k in inner_inc for v in new_runs[k]
-                    ]
-
-                final = b.fold(shape[a], init, step)
-                for i, v in zip(inner_red, final[:nr], strict=True):
-                    store(b, outs[i].acc, v, po[i])
-                for n, i in enumerate(inner_inc):
-                    flush_run(
-                        i, out_dtypes[i], po[i], *final[nr + 2 * n : nr + 2 * n + 2]
-                    )
+                innermost(a, ptrs, index)
                 return
             if a == nd:
                 pi, po = split(ptrs)
