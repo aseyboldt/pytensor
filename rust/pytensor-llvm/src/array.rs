@@ -461,6 +461,109 @@ unsafe fn copy_strided(
         block *= shape[nd - 1];
         nd -= 1;
     }
+    // single elements whose source and destination run along different axes (a
+    // transpose): copy tile by tile, so reads and writes each stay on a few cache lines
+    let inner = |strides: &[i64]| {
+        (0..nd)
+            .filter(|&a| shape[a] > 1)
+            .min_by_key(|&a| strides[a].abs())
+    };
+    if let (true, Some(sa), Some(da)) = (
+        block == itemsize as i64,
+        inner(src_strides),
+        inner(dst_strides),
+    ) && sa != da
+        && shape[sa] >= 8
+        && shape[da] >= 8
+    {
+        // SAFETY: the caller's contract
+        unsafe {
+            match itemsize {
+                8 => copy_tiled::<u64>(src, shape, src_strides, dst, dst_strides, sa, da),
+                4 => copy_tiled::<u32>(src, shape, src_strides, dst, dst_strides, sa, da),
+                2 => copy_tiled::<u16>(src, shape, src_strides, dst, dst_strides, sa, da),
+                1 => copy_tiled::<u8>(src, shape, src_strides, dst, dst_strides, sa, da),
+                16 => copy_tiled::<u128>(src, shape, src_strides, dst, dst_strides, sa, da),
+                _ => copy_blocks(src, shape, src_strides, dst, dst_strides, nd, block),
+            }
+        }
+        return;
+    }
+    // SAFETY: the caller's contract
+    unsafe { copy_blocks(src, shape, src_strides, dst, dst_strides, nd, block) }
+}
+
+/// Copy `T`s between arrays of `shape`, axes `sa` and `da` (where the source and the
+/// destination step least) in tiles, the other axes one by one.
+///
+/// # Safety
+/// As `copy_strided`, with elements of `size_of::<T>()` bytes.
+unsafe fn copy_tiled<T: Copy>(
+    src: *const u8,
+    shape: &[i64],
+    src_strides: &[i64],
+    dst: *mut u8,
+    dst_strides: &[i64],
+    sa: usize,
+    da: usize,
+) {
+    const TILE: i64 = 16;
+    let outer: Vec<usize> = (0..shape.len()).filter(|&a| a != sa && a != da).collect();
+    let mut idx = vec![0i64; outer.len()];
+    loop {
+        let (mut so, mut d) = (0isize, 0isize);
+        for (k, &a) in outer.iter().enumerate() {
+            so += (idx[k] * src_strides[a]) as isize;
+            d += (idx[k] * dst_strides[a]) as isize;
+        }
+        for i0 in (0..shape[sa]).step_by(TILE as usize) {
+            for j0 in (0..shape[da]).step_by(TILE as usize) {
+                for i in i0..(i0 + TILE).min(shape[sa]) {
+                    for j in j0..(j0 + TILE).min(shape[da]) {
+                        let (s1, d1) = (
+                            so + (i * src_strides[sa] + j * src_strides[da]) as isize,
+                            d + (i * dst_strides[sa] + j * dst_strides[da]) as isize,
+                        );
+                        // SAFETY: index < shape on every axis: inside both arrays
+                        unsafe {
+                            (dst.offset(d1) as *mut T)
+                                .write_unaligned((src.offset(s1) as *const T).read_unaligned())
+                        };
+                    }
+                }
+            }
+        }
+        if !next_index(&mut idx, |k| shape[outer[k]]) {
+            return;
+        }
+    }
+}
+
+/// Advance `idx` (last axis fastest) within lengths `len(k)`; false after the last.
+fn next_index(idx: &mut [i64], len: impl Fn(usize) -> i64) -> bool {
+    for a in (0..idx.len()).rev() {
+        idx[a] += 1;
+        if idx[a] < len(a) {
+            return true;
+        }
+        idx[a] = 0;
+    }
+    false
+}
+
+/// Copy the leading `nd` axes one by one, each position a `block` of bytes.
+///
+/// # Safety
+/// As `copy_strided`; both arrays are packed over the axes after `nd`.
+unsafe fn copy_blocks(
+    src: *const u8,
+    shape: &[i64],
+    src_strides: &[i64],
+    dst: *mut u8,
+    dst_strides: &[i64],
+    nd: usize,
+    block: i64,
+) {
     let mut idx = vec![0i64; nd];
     loop {
         let (mut so, mut d) = (0isize, 0isize);
@@ -471,17 +574,8 @@ unsafe fn copy_strided(
         // SAFETY: the offsets stay inside both arrays (index < shape on every axis), and
         // so does the block: both arrays are packed over the trailing axes.
         unsafe { std::ptr::copy_nonoverlapping(src.offset(so), dst.offset(d), block as usize) };
-        let mut a = nd;
-        loop {
-            if a == 0 {
-                return;
-            }
-            a -= 1;
-            idx[a] += 1;
-            if idx[a] < shape[a] {
-                break;
-            }
-            idx[a] = 0;
+        if !next_index(&mut idx, |a| shape[a]) {
+            return;
         }
     }
 }
@@ -878,6 +972,34 @@ mod tests {
         assert!(other.as_mut().unwrap().copy_from(&source).is_err());
         let mut other = OwnedArray::zeros(DType::Int64, vec![2, 3]).unwrap();
         assert!(other.as_mut().unwrap().copy_from(&source).is_err());
+    }
+
+    #[test]
+    fn transposing_copies_go_by_tiles() {
+        // (3, 20, 37) read with its last two axes swapped: tiles with ragged edges
+        let (n0, n1, n2) = (3i64, 20, 37);
+        let values: Vec<f64> = (0..n0 * n1 * n2).map(|v| v as f64).collect();
+        let mut out = vec![0.0f64; values.len()];
+        let src_strides = [n1 * n2 * 8, 8, n2 * 8];
+        // SAFETY: both cover n0 * n1 * n2 elements, disjoint
+        unsafe {
+            copy_strided(
+                values.as_ptr() as *const u8,
+                &[n0, n2, n1],
+                &src_strides,
+                out.as_mut_ptr() as *mut u8,
+                &[n2 * n1 * 8, n1 * 8, 8],
+                8,
+            )
+        };
+        for (i, j, k) in
+            (0..n0).flat_map(|i| (0..n2).flat_map(move |j| (0..n1).map(move |k| (i, j, k))))
+        {
+            assert_eq!(
+                out[(i * n2 * n1 + j * n1 + k) as usize],
+                values[(i * n1 * n2 + k * n2 + j) as usize]
+            );
+        }
     }
 
     #[test]
