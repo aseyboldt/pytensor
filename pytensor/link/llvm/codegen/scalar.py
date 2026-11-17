@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import operator
 from functools import reduce, singledispatch
+from itertools import accumulate
 
 import pytensor.scalar.basic as ps
 import pytensor.scalar.math as psm
@@ -309,7 +310,6 @@ def _rust_op(name):
 
 
 register(psm.Gamma)(_rust_op("Gamma"))
-register(psm.Erfcx)(_rust_op("Erfcx"))
 
 # Lanczos coefficients of CPython's lgamma
 _LANCZOS_G = 6.024680040776729583740234375
@@ -406,6 +406,73 @@ def psi(x):
     r = (x.eq(_intr("Floor", x)) & (x < 0.0)).select(math.nan, r)
     r = x.eq(0.0).select((1.0 / x > 0.0).select(-inf, inf), r)
     return x.eq(-math.inf).select(math.nan, r)
+
+
+# erfc's rational functions of 1/x^2 (fdlibm s_erf.c) on [1.25, 1/0.35) and above, low degree first
+_ERFC_RA = (
+    -9.86494403484714822705e-03,
+    -6.93858572707181764372e-01,
+    -1.05586262253232909814e01,
+    -6.23753324503260060396e01,
+    -1.62396669462573470355e02,
+    -1.84605092906711035994e02,
+    -8.12874355063065934246e01,
+    -9.81432934416914548592e00,
+)
+_ERFC_SA = (
+    1.0,
+    1.96512716674392571292e01,
+    1.37657754143519042600e02,
+    4.34565877475229228821e02,
+    6.45387271733267880336e02,
+    4.29008140027567833386e02,
+    1.08635005541779435134e02,
+    6.57024977031928170135e00,
+    -6.04244152148580987438e-02,
+)
+_ERFC_RB = (
+    -9.86494292470009928597e-03,
+    -7.99283237680523006574e-01,
+    -1.77579549177547519889e01,
+    -1.60636384855821916062e02,
+    -6.37566443368389627722e02,
+    -1.02509513161107724954e03,
+    -4.83519191608651397019e02,
+)
+_ERFC_SB = (
+    1.0,
+    3.03380607434824582924e01,
+    3.25792512996573918826e02,
+    1.53672958608443695994e03,
+    3.19985821950859553908e03,
+    2.55305040643316442583e03,
+    4.74528541206955367215e02,
+    -2.24409524465858183362e01,
+)
+
+
+@register(psm.Erfcx)
+@_special
+def erfcx(x):
+    """exp(x^2) erfc(x): erfc's rational function past 1.25, the asymptotic series past 12."""
+    ax = abs(x)
+    s = 1.0 / (ax * ax)
+    a = (ax < 1 / 0.35).select(
+        _horner(s, _ERFC_RA[::-1]) / _horner(s, _ERFC_SA[::-1]),
+        _horner(s, _ERFC_RB[::-1]) / _horner(s, _ERFC_SB[::-1]),
+    )
+    # sum_n (-1)^n (2n-1)!! / (2x^2)^n, n < 16
+    terms = list(accumulate(range(1, 16), lambda t, n: -t * (2 * n - 1), initial=1.0))
+    series = _horner(0.5 * s, terms[::-1]) * (1 / math.sqrt(math.pi))
+    pos = (ax < 12.0).select(_call("Exp", a - 0.5625), series) / ax
+    # x <= -1.25: 2 exp(x^2) - erfcx(-x), with x^2 = x2 + low exactly (Dekker)
+    x2 = x * x
+    hi = x * 134217729.0 - (x * 134217729.0 - x)
+    low = ((hi * hi - x2) + 2.0 * hi * (x - hi)) + (x - hi) * (x - hi)
+    low = (x2 < math.inf).select(low, 0.0)
+    neg = 2.0 * _call("Exp", x2) * (1.0 + low) - pos
+    mid = _call("Exp", x2) * _call("Erfc", x)
+    return (x >= 1.25).select(pos, (x > -1.25).select(mid, neg))
 
 
 @register(psm.Sigmoid)

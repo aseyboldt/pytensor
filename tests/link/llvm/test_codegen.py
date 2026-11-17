@@ -164,6 +164,7 @@ def test_erfcx():
     special = [11.9999999, 12.0, 1e300, -27.0, np.inf, -np.inf, np.nan]
     values = np.concatenate([np.linspace(-26.5, 40, 1001), special])
     check(pt.erfcx(x), [x], [values], rtol=1e-13, atol=0)
+    check(pt.erfc(x), [x], [np.linspace(-6, 20, 1001)], rtol=1e-13, atol=0)
 
 
 @pytest.mark.parametrize("c", [-8, -2.5, -1, -0.5, 0, 0.5, 1.5, 3, 7.5])

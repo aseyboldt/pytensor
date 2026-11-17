@@ -269,10 +269,6 @@ impl Libm {
             1
         }
     }
-
-    fn has_vector_variant(self) -> bool {
-        !matches!(self, Libm::Erf | Libm::Erfc)
-    }
 }
 
 /// Scalar functions precompiled in Rust.
@@ -1664,7 +1660,7 @@ impl Builder {
         let r = self.call_raw(fnty, f, &mut raw, &t).unwrap();
         self.fast(r.raw);
         let variants = super::module::vector_variants();
-        if which.has_vector_variant() && !variants.is_empty() {
+        if !variants.is_empty() {
             let vparams = "v".repeat(args.len());
             let mut names = Vec::new();
             for (isa, lanes64) in variants {
