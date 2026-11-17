@@ -1,5 +1,7 @@
 """Ops on the LLVM path, against PyTensor's reference implementation."""
 
+import re
+
 import numpy as np
 import pytest
 
@@ -231,6 +233,18 @@ def test_matrix_vector_kernels():
     m[3, 5] = np.inf
     outs = [a.T @ v[:14:2], v[:7] @ a, a @ v[:30], a @ v[::2], a[:, :5] @ v[:5]]
     compare([a, v], outs, [m, x])
+
+
+def test_constants_keep_their_memory_order():
+    # a matrix and its transpose (one buffer), and a permuted 3-d constant
+    m, t = rng.normal(size=(6, 5)), rng.normal(size=(2, 3, 4)).transpose(2, 0, 1)
+    a, b, v, x = pt.constant(m), pt.constant(m.T), pt.vector("v"), pt.matrix("x")
+    c = pt.constant(t)
+    outs = [a @ v[:5], b @ v, b * x, b[1:, ::2] * x[0, 0], c * x[0, 0], b]
+    f = compare([v, x], outs, [rng.normal(size=6), rng.normal(size=(5, 6))])
+    dump = f.maker.linker.program.dump()
+    at = dict(re.findall(r"(\[\d+, \d+\]) +constant at (\w+)", dump))
+    assert at["[6, 5]"] == at["[5, 6]"]
 
 
 @pytest.mark.parametrize("axis", [0, 1, -1])
