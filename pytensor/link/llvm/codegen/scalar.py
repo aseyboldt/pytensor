@@ -129,10 +129,31 @@ def _(b, args, out):
 @register(ps.Pow)
 def _(b, args, out):
     if is_float(out):
-        return b.libm(ir.Libm.Pow, [conv(b, args, 0, out), conv(b, args, 1, out)])
+        x, e = nums(b, args, out)
+        c = e.const_value
+        if c is not None and abs(c) <= 8 and (2 * c).is_integer():
+            return _const_pow(x, c).value
+        return b.libm(ir.Libm.Pow, [x.value, e.value])
     if out == "bool":
         raise NotImplementedError("LLVM backend: pow with output dtype bool")
     return int_pow(b, conv(b, args, 0, out), conv(b, args, 1, out), out)
+
+
+def _const_pow(x, c):
+    """x**c for c a multiple of 1/2 by products and a sqrt (vectorizes, unlike pow),
+    with pow's values at 0 and -inf where the sqrt would get them wrong."""
+    n, half = int(abs(c)), abs(c) % 1 == 0.5
+    p, sq = Num.const(x.b, x.dtype, 1.0), x
+    while n:
+        p, sq, n = (p * sq if n & 1 else p), sq * sq, n >> 1
+    if half:
+        p = p * Num(x.b, ir_intrinsic(x.b, "Sqrt", x.value), x.dtype)
+    p = 1.0 / p if c < 0 else p
+    if not half:
+        return p
+    inf = Num.const(x.b, x.dtype, math.inf)
+    p = x.eq(0.0).select(inf if c < 0 else 0.0, p)
+    return x.eq(-math.inf).select(0.0 if c < 0 else inf, p)
 
 
 def int_pow(b, x, e, dtype):

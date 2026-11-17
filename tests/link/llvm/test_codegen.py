@@ -166,6 +166,22 @@ def test_erfcx():
     check(pt.erfcx(x), [x], [values], rtol=1e-13, atol=0)
 
 
+@pytest.mark.parametrize("c", [-8, -2.5, -1, -0.5, 0, 0.5, 1.5, 3, 7.5])
+def test_pow_by_a_multiple_of_one_half(c):
+    """Products and a sqrt instead of pow, with C pow's special values (as for other
+    exponents): numpy's differs at -inf for non-integers."""
+    x = pt.vector("x")
+    special = [0.0, -0.0, -1.0, -2.5, np.inf, -np.inf, np.nan, 1.0]
+    values = np.concatenate([np.geomspace(1e-3, 1e3, 200), special])
+    node = (x**c).owner
+    (res,) = run_node(node, *reference(node.inputs, [x], [values]))
+    with np.errstate(all="ignore"):
+        want = np.power(values, c)
+    if c % 1:
+        want[values == -np.inf] = np.inf if c > 0 else 0.0
+    np.testing.assert_allclose(res, want, rtol=1e-14, atol=0)
+
+
 def test_gammaln_and_psi():
     """Reflected below 0, tiny and huge arguments, the zeros at 1 and 2, poles and the
     special values. (Near poles scipy's psi is off by up to 1e-12: not tested there.)"""
