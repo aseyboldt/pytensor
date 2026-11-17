@@ -291,7 +291,8 @@ mod simd {
 
     use super::Float;
 
-    /// y = A x for A with contiguous rows: `R` rows at a time, `L` independent lanes
+    /// y = A x for A with contiguous rows: `R` rows at a time, from `R` separate parts of
+    /// A (so each is a sequential stream for the prefetcher), `L` independent lanes
     /// along each row (so LLVM vectorizes without reassociating), x contiguous.
     #[inline(always)]
     unsafe fn gemv_rows_impl<T: Float, const FMA: bool, const R: usize, const L: usize>(
@@ -303,10 +304,9 @@ mod simd {
         y: *mut T,
         incy: isize,
     ) {
-        let kl = k - k % L;
-        let mut i = 0;
-        while i + R <= m {
-            let rows: [*const T; R] = std::array::from_fn(|r| a.offset((i + r) as isize * rsa));
+        let (h, kl) = (m / R, k - k % L);
+        for i in 0..h {
+            let rows: [*const T; R] = std::array::from_fn(|r| a.offset((i + r * h) as isize * rsa));
             let mut acc = [[T::default(); L]; R];
             let mut j = 0;
             while j < kl {
@@ -330,18 +330,16 @@ mod simd {
                 for j in kl..k {
                     s = s.madd::<FMA>(*rows[r].add(j), *x.add(j));
                 }
-                *y.offset((i + r) as isize * incy) = s;
+                *y.offset((i + r * h) as isize * incy) = s;
             }
-            i += R;
         }
-        while i < m {
+        for i in R * h..m {
             let row = a.offset(i as isize * rsa);
             let mut s = T::default();
             for j in 0..k {
                 s = s.madd::<FMA>(*row.add(j), *x.add(j));
             }
             *y.offset(i as isize * incy) = s;
-            i += 1;
         }
     }
 
@@ -356,16 +354,20 @@ mod simd {
         y: *mut T,
         incy: isize,
     ) {
-        if k < 24 {
-            gemv_rows_impl::<T, true, 4, 4>(m, k, a, rsa, x, y, incy)
+        // four streams once A is past the caches
+        if m * k * size_of::<T>() > 8 << 20 {
+            gemv_rows_impl::<T, true, 4, 8>(m, k, a, rsa, x, y, incy)
+        } else if k < 64 {
+            gemv_rows_impl::<T, true, 2, 4>(m, k, a, rsa, x, y, incy)
         } else {
             gemv_rows_impl::<T, true, 2, 8>(m, k, a, rsa, x, y, incy)
         }
     }
 
-    /// y = A x for A with contiguous columns, 4 columns at a time (y stays in cache).
+    /// y = A x for A with contiguous columns, `C` at a time from `C` separate parts of A
+    /// (each a sequential stream for the prefetcher; y stays in cache).
     #[inline(always)]
-    unsafe fn gemv_columns_impl<T: Float, const FMA: bool>(
+    unsafe fn gemv_columns_impl<T: Float, const FMA: bool, const C: usize>(
         m: usize,
         k: usize,
         a: *const T,
@@ -378,22 +380,19 @@ mod simd {
         y.fill(T::default());
         let column = |j: usize| a.offset(j as isize * csa);
         let at = |j: usize| *x.offset(j as isize * incx);
-        let mut j = 0;
-        while j + 4 <= k {
-            let (c, xs) = (
-                [0, 1, 2, 3].map(|q| column(j + q)),
-                [0, 1, 2, 3].map(|q| at(j + q)),
-            );
+        let h = k / C;
+        for j in 0..h {
+            let js: [usize; C] = std::array::from_fn(|q| j + q * h);
+            let (c, xs) = (js.map(column), js.map(at));
             for (i, yi) in y.iter_mut().enumerate() {
-                *yi = yi
-                    .madd::<FMA>(*c[0].add(i), xs[0])
-                    .madd::<FMA>(*c[1].add(i), xs[1])
-                    .madd::<FMA>(*c[2].add(i), xs[2])
-                    .madd::<FMA>(*c[3].add(i), xs[3]);
+                let mut s = *yi;
+                for q in 0..C {
+                    s = s.madd::<FMA>(*c[q].add(i), xs[q]);
+                }
+                *yi = s;
             }
-            j += 4;
         }
-        for j in j..k {
+        for j in C * h..k {
             let (c, xj) = (column(j), at(j));
             for (i, yi) in y.iter_mut().enumerate() {
                 *yi = yi.madd::<FMA>(*c.add(i), xj);
@@ -412,7 +411,11 @@ mod simd {
         incx: isize,
         y: *mut T,
     ) {
-        gemv_columns_impl::<T, true>(m, k, a, csa, x, incx, y)
+        if k >= 128 {
+            gemv_columns_impl::<T, true, 8>(m, k, a, csa, x, incx, y)
+        } else {
+            gemv_columns_impl::<T, true, 4>(m, k, a, csa, x, incx, y)
+        }
     }
 
     /// `y = A x` for `k` columns of `m` adjacent elements, `csa` elements apart, `x` of
@@ -435,7 +438,7 @@ mod simd {
                 return gemv_columns_avx2(m, k, a, csa, x, incx, y);
             }
         }
-        gemv_columns_impl::<T, false>(m, k, a, csa, x, incx, y)
+        gemv_columns_impl::<T, false, 4>(m, k, a, csa, x, incx, y)
     }
 
     /// `y = A x` for `m` rows of `k` adjacent elements, `rsa` elements apart, `x` of `k`
@@ -459,7 +462,7 @@ mod simd {
                 return gemv_rows_avx2(m, k, a, rsa, x, y, incy);
             }
         }
-        gemv_rows_impl::<T, false, 4, 4>(m, k, a, rsa, x, y, incy)
+        gemv_rows_impl::<T, false, 2, 4>(m, k, a, rsa, x, y, incy)
     }
 }
 

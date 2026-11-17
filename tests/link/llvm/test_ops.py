@@ -233,6 +233,11 @@ def test_matrix_vector_kernels():
     m[3, 5] = np.inf
     outs = [a.T @ v[:14:2], v[:7] @ a, a @ v[:30], a @ v[::2], a[:, :5] @ v[:5]]
     compare([a, v], outs, [m, x])
+    # rows (columns of A^T) from 2, 4 or 8 separate parts of A, with leftovers
+    for shape in [(9, 70), (1103, 1000), (131, 6)]:
+        m, w = rng.normal(size=shape), rng.normal(size=max(shape))
+        outs = [a @ v[: shape[1]], a.T @ v[: shape[0]]]
+        compare([a, v], outs, [m, w], rtol=1e-9)
 
 
 def test_constants_keep_their_memory_order():
