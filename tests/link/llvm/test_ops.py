@@ -600,6 +600,17 @@ def test_fused_index_checks_dont_branch():
     assert f(np.zeros(0), np.zeros(0, dtype="int64")) == 0
 
 
+def test_fused_loops_vectorize_past_the_cost_model():
+    # frailty_coxph's loop: LLVM's cost model left it scalar, with a scalar log call
+    x, v, w = pt.matrix("x"), pt.row("v"), pt.col("w")
+    c = pt.constant(rng.random((30, 12)) > 0.3)
+    q, a = pt.eq(x, 0) & c, pt.eq(pt.log(x), -np.inf) & c
+    out = (pt.switch(a, 0.0, 2.0 / v) - pt.switch(q, 0.0, 3.0 * w)).sum(axis=0)
+    vals = [rng.random((30, 12)) + 0.1, rng.random((1, 12)) + 0.5, rng.random((30, 1))]
+    f = compare([x, v, w], out, vals)
+    assert "llvm.loop.vectorize.enable" in f.maker.linker.ir()
+
+
 def test_shared_gather_fuses_into_each_client():
     # matrix factorization: U[i] and V[j] feed the prediction and both gradients
     U, V, y = pt.matrix("U"), pt.matrix("V"), pt.vector("y")

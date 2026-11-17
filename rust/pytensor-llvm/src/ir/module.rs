@@ -238,6 +238,22 @@ pub struct Module {
     label: RefCell<Option<String>>,
 }
 
+/// LLVM diagnostics: errors go to stderr; warnings and remarks (such as a loop
+/// `fold(vectorize=True)` asked for that couldn't be vectorized) are dropped.
+extern "C" fn errors_only(
+    info: llvm_sys::prelude::LLVMDiagnosticInfoRef,
+    _: *mut std::ffi::c_void,
+) {
+    // SAFETY: LLVM passes a live diagnostic; its description is ours to free.
+    unsafe {
+        if c::LLVMGetDiagInfoSeverity(info) == llvm_sys::LLVMDiagnosticSeverity::LLVMDSError {
+            let d = c::LLVMGetDiagInfoDescription(info);
+            eprintln!("LLVM error: {}", CStr::from_ptr(d).to_string_lossy());
+            c::LLVMDisposeMessage(d);
+        }
+    }
+}
+
 #[pymethods]
 impl Module {
     #[new]
@@ -247,6 +263,7 @@ impl Module {
         // SAFETY: creating a fresh context and a module in it.
         let (ctx, module) = unsafe {
             let ctx = c::LLVMContextCreate();
+            c::LLVMContextSetDiagnosticHandler(ctx, Some(errors_only), std::ptr::null_mut());
             let n = cstring(name);
             (ctx, c::LLVMModuleCreateWithNameInContext(n.as_ptr(), ctx))
         };
@@ -749,6 +766,7 @@ fn optimized_text(ir: &str, opt_level: u32) -> Result<String, String> {
     // memory buffer; messages are freed.
     unsafe {
         let ctx = c::LLVMContextCreate();
+        c::LLVMContextSetDiagnosticHandler(ctx, Some(errors_only), std::ptr::null_mut());
         let buf = c::LLVMCreateMemoryBufferWithMemoryRangeCopy(
             text.as_ptr(),
             text.as_bytes().len(),

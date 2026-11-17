@@ -545,6 +545,7 @@ def emit_fused(op, node, cg, inputs, outputs):
                 m,
                 list(accs),
                 lambda j, *accs: compute(b.add(start, j), accs, defer(j))[0],
+                vectorize=True,
             )
 
             # one loop per output: each a single stream of writes, which vectorizes
@@ -578,7 +579,9 @@ def emit_fused(op, node, cg, inputs, outputs):
             n_chunks = b.sdiv(b.add(n, b.i64(CHUNK - 1)), b.i64(CHUNK))
             final = b.fold(n_chunks, init, chunk)
         else:
-            final = b.fold(shape[a], init, lambda i, *accs: compute(i, accs)[0])
+            final = b.fold(
+                shape[a], init, lambda i, *accs: compute(i, accs)[0], vectorize=True
+            )
         for i, v in zip(inner_red, final, strict=True):
             store(b, outs[i].acc, v, po[i])
 
@@ -649,7 +652,7 @@ def emit_fused(op, node, cg, inputs, outputs):
             new, _ = body(pi, po, [None] * nd, dict(zip(red, accs, strict=True)))
             return [new[k] for k in red]
 
-        final = b.fold(size(b, shape), init, step)
+        final = b.fold(size(b, shape), init, step, vectorize=True)
         for i, v in zip(red, final, strict=True):
             store(b, outs[i].acc, v, plain_out[i].data)
         return []

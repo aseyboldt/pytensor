@@ -835,9 +835,30 @@ impl Builder {
         }
     }
 
-    fn cond_br(&self, cond: LLVMValueRef, t: LLVMBasicBlockRef, f: LLVMBasicBlockRef) {
+    fn cond_br(
+        &self,
+        cond: LLVMValueRef,
+        t: LLVMBasicBlockRef,
+        f: LLVMBasicBlockRef,
+    ) -> LLVMValueRef {
         // SAFETY: `cond` is an i1 in this function; the blocks belong to it.
-        unsafe { c::LLVMBuildCondBr(self.b, cond, t, f) };
+        unsafe { c::LLVMBuildCondBr(self.b, cond, t, f) }
+    }
+
+    /// Mark the loop whose back edge is `latch_br` to be vectorized whatever the cost
+    /// model says (it still picks the width).
+    fn force_vectorize(&self, latch_br: LLVMValueRef) {
+        use llvm_sys::debuginfo::{LLVMMetadataReplaceAllUsesWith, LLVMTemporaryMDNode};
+        // SAFETY: metadata of the module's context; the temporary self-reference is
+        // replaced by the loop id, as loop ids must start with themselves.
+        unsafe {
+            let tmp = LLVMTemporaryMDNode(self.m.ctx, std::ptr::null_mut(), 0);
+            let on = c::LLVMValueAsMetadata(c::LLVMConstInt(self.lt(&Ty::Int(1)), 1, 0));
+            let hint = self.md_node(&mut [self.md_string("llvm.loop.vectorize.enable"), on]);
+            let id = self.md_node(&mut [tmp, hint]);
+            LLVMMetadataReplaceAllUsesWith(tmp, id);
+            c::LLVMSetMetadata(latch_br, self.md_kind("llvm.loop"), self.md_value(id));
+        }
     }
 
     fn check_values(&self, what: &str, vals: &[Value], want: &[Ty]) -> PyResult<()> {
@@ -1975,7 +1996,10 @@ impl Builder {
     /// With `until=True` the body returns one more value, an i1 stop flag; the loop
     /// ends after the first step that sets it, and the flag is returned last (false
     /// when no step ran).
-    #[pyo3(signature = (n, init, body, until=false))]
+    ///
+    /// With `vectorize=True` the loop is vectorized even where LLVM's cost model
+    /// wouldn't (short or mixed bodies that still gain).
+    #[pyo3(signature = (n, init, body, until=false, vectorize=false))]
     fn fold(
         &self,
         py: Python<'_>,
@@ -1983,6 +2007,7 @@ impl Builder {
         init: Vec<Value>,
         body: Py<PyAny>,
         until: bool,
+        vectorize: bool,
     ) -> PyResult<Vec<Value>> {
         self.open()?;
         let n = self.i64_of("fold count", n)?;
@@ -2044,7 +2069,10 @@ impl Builder {
             }
             (next, more)
         };
-        self.cond_br(more, header, exit);
+        let br = self.cond_br(more, header, exit);
+        if vectorize {
+            self.force_vectorize(br);
+        }
         // SAFETY: completing the phis with the latch's values.
         unsafe {
             let (mut nv, mut lb) = (next, latch);
