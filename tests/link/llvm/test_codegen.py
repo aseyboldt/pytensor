@@ -28,14 +28,11 @@ def run_node(node, *values, provided=None, provided_layouts=None):
         else:
             outs.append((np.dtype(o.type.dtype), o.type.ndim))
     # constants are inputs of the node function too
-    ins = []
     it = iter(values)
-    for i in node.inputs:
-        ins.append(
-            np.asarray(
-                i.data if isinstance(i, Constant) else next(it), dtype=i.type.dtype
-            )
-        )
+    ins = [
+        np.asarray(i.data if isinstance(i, Constant) else next(it), dtype=i.type.dtype)
+        for i in node.inputs
+    ]
     return ir.call_kernel(c.address, ins, outs)
 
 
@@ -167,6 +164,25 @@ def test_erfcx():
     special = [11.9999999, 12.0, 1e300, -27.0, np.inf, -np.inf, np.nan]
     values = np.concatenate([np.linspace(-26.5, 40, 1001), special])
     check(pt.erfcx(x), [x], [values], rtol=1e-13, atol=0)
+
+
+def test_gammaln_and_psi():
+    """Reflected below 0, tiny and huge arguments, the zeros at 1 and 2, poles and the
+    special values. (Near poles scipy's psi is off by up to 1e-12: not tested there.)"""
+    x = pt.vector("x")
+    special = [0.0, -0.0, 1.0, 2.0, -3.0, 1e-25, 1e300, np.inf, np.nan]
+    values = np.concatenate(
+        [
+            np.linspace(-20.3, 60, 997),
+            np.geomspace(1e-19, 1e6, 300),
+            1 + 1e-7 * rng.normal(size=20),
+            special,
+        ]
+    )
+    check(pt.gammaln(x), [x], [values], rtol=1e-13, atol=1e-14)
+    check(pt.psi(x), [x], [values], rtol=1e-12, atol=1e-13)
+    x32 = pt.vector("x", dtype="float32")
+    check(pt.gammaln(x32), [x32], [values.astype("float32")], rtol=1e-6, atol=1e-7)
 
 
 @pytest.mark.parametrize(

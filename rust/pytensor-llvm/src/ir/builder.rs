@@ -1701,6 +1701,11 @@ impl Builder {
                     v.len() as u32,
                 );
                 c::LLVMAddCallSiteAttribute(r.raw, llvm_sys::LLVMAttributeFunctionIndex, a);
+                // else LLVM turns calls it can tell set no errno (log of a positive) into
+                // intrinsics, which it vectorizes as scalar calls
+                let nb = c::LLVMGetEnumAttributeKindForName(c"nobuiltin".as_ptr(), 9);
+                let a = c::LLVMCreateEnumAttribute(self.m.ctx, nb, 0);
+                c::LLVMAddCallSiteAttribute(r.raw, llvm_sys::LLVMAttributeFunctionIndex, a);
             }
         }
         Ok(r)

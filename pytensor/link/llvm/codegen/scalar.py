@@ -287,10 +287,104 @@ def _rust_op(name):
     return fn
 
 
-register(psm.GammaLn)(_rust_op("GammaLn"))
 register(psm.Gamma)(_rust_op("Gamma"))
-register(psm.Psi)(_rust_op("Psi"))
 register(psm.Erfcx)(_rust_op("Erfcx"))
+
+# Lanczos coefficients of CPython's lgamma
+_LANCZOS_G = 6.024680040776729583740234375
+_LANCZOS_NUM = (
+    23531376880.410759688572007674451636754734846804940,
+    42919803642.649098768957899047001988850926355848959,
+    35711959237.355668049440185451547166705960488635843,
+    17921034426.037209699919755754458931112671403265390,
+    6039542586.3520280050642916443072979210699388420708,
+    1439720407.3117216736632230727949123939715485786772,
+    248874557.86205415651146038641322942321632125127801,
+    31426415.585400194380614231628318205362874684987640,
+    2876370.6289353724412254090516208496135991145378768,
+    186056.26539522349504029498971604569928220784236328,
+    8071.6720023658162106380029022722506138218516325024,
+    210.82427775157934587250973392071336271166969580291,
+    2.5066282746310002701649081771338373386264310793408,
+)
+_LANCZOS_DEN = (
+    0.0,
+    39916800.0,
+    120543840.0,
+    150917976.0,
+    105258076.0,
+    45995730.0,
+    13339535.0,
+    2637558.0,
+    357423.0,
+    32670.0,
+    1925.0,
+    66.0,
+    1.0,
+)
+
+
+def _horner(x, coefs):
+    acc = Num.const(x.b, x.dtype, coefs[0])
+    for c in coefs[1:]:
+        acc = acc * x + c
+    return acc
+
+
+def _call(fn, x):
+    return Num(x.b, x.b.libm(getattr(ir.Libm, fn), [x.value]), x.dtype)
+
+
+def _intr(fn, x):
+    return Num(x.b, ir_intrinsic(x.b, fn, x.value), x.dtype)
+
+
+def _special(fn):
+    """Branchless, in float64, so loops with it vectorize (libm calls go to libmvec)."""
+
+    def emit(b, args, out):
+        require_float(out, fn.__name__)
+        return fn(Num(b, conv(b, args, 0, "float64"), "float64")).astype(out).value
+
+    return emit
+
+
+@register(psm.GammaLn)
+@_special
+def gammaln(x):
+    """CPython's lgamma; its Lanczos sum in 1/x only, which doesn't overflow above 1e-20."""
+    ax, inf = abs(x), Num.const(x.b, x.dtype, math.inf)
+    inv = 1.0 / ax
+    r = _call("Log", _horner(inv, _LANCZOS_NUM) / _horner(inv, _LANCZOS_DEN))
+    r = r - _LANCZOS_G + (ax - 0.5) * (_call("Log", ax + (_LANCZOS_G - 0.5)) - 1.0)
+    # reflection, with |sin(pi x)| = |sin(pi (x - round(x)))|; one log for it and tiny x
+    sin = _call("Sin", (x - _intr("RoundEven", x)) * math.pi)
+    tiny, neg = ax < 1e-20, x < 0.0
+    lg = _call("Log", tiny.select(ax, neg.select(abs(sin) * ax, ax)))
+    r = tiny.select(-lg, neg.select(math.log(math.pi) - lg - r, r))
+    whole = x.eq(_intr("Floor", x)) & (x <= 2.0)
+    r = whole.select((x <= 0.0).select(inf, 0.0), r)
+    return ax.eq(math.inf).select(inf, r)  # (NaN stays NaN)
+
+
+@register(psm.Psi)
+@_special
+def psi(x):
+    """Digamma: reflected below 0, shifted up to 10 in ten steps, then the series."""
+    one, inf = Num.const(x.b, x.dtype, 1.0), Num.const(x.b, x.dtype, math.inf)
+    y, acc = (x < 0.0).select(1.0 - x, x), Num.const(x.b, x.dtype, 0.0)
+    for _ in range(10):
+        low = y < 10.0
+        acc, y = acc - low.select(1.0 / y, 0.0), y + low.select(one, 0.0)
+    f = 1.0 / (y * y)
+    # -sum B_2k / (2k y^2k), k = 1..7
+    bern = (-1 / 12, 691 / 32760, -1 / 132, 1 / 240, -1 / 252, 1 / 120, -1 / 12)
+    r = acc + _call("Log", y) - 0.5 / y + f * _horner(f, bern)
+    tan = _call("Tan", (x - _intr("RoundEven", x)) * math.pi)
+    r = (x < 0.0).select(r - math.pi / tan, r)
+    r = (x.eq(_intr("Floor", x)) & (x < 0.0)).select(math.nan, r)
+    r = x.eq(0.0).select((1.0 / x > 0.0).select(-inf, inf), r)
+    return x.eq(-math.inf).select(math.nan, r)
 
 
 @register(psm.Sigmoid)
