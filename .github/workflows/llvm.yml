@@ -115,9 +115,6 @@ jobs:
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
 
-      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
-        if: runner.os == 'Windows'
-
       - name: Restore LLVM
         id: llvm-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -126,8 +123,20 @@ jobs:
           key: llvm-${{ matrix.name }}-${{ matrix.container }}-${{ env.MACOSX_DEPLOYMENT_TARGET }}-${{ hashFiles('rust/pytensor-llvm/llvm-version.txt', 'rust/pytensor-llvm/llvm-minimal.cmake', 'rust/pytensor-llvm/ci/build-llvm.sh') }}
 
       - name: Build LLVM
-        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        if: steps.llvm-cache.outputs.cache-hit != 'true' && runner.os != 'Windows'
         run: bash rust/pytensor-llvm/ci/build-llvm.sh "$GITHUB_WORKSPACE/.llvm"
+
+      # LLVM's install-distribution needs a single-config generator (Ninja), and Ninja
+      # needs MSVC's developer environment: set up here, for this step only (in later
+      # steps it would make rustc pick up Git Bash's `link` instead of MSVC's).
+      - name: Build LLVM (Windows)
+        if: steps.llvm-cache.outputs.cache-hit != 'true' && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          Import-Module "$vs\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+          Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments "-arch=x64 -host_arch=x64"
+          & "$env:ProgramFiles\Git\bin\bash.exe" rust/pytensor-llvm/ci/build-llvm.sh "$env:GITHUB_WORKSPACE/.llvm"
 
       - name: Save LLVM
         if: steps.llvm-cache.outputs.cache-hit != 'true'
@@ -202,10 +211,6 @@ jobs:
         with:
           name: llvm-wheel-${{ matrix.name }}
           path: wheel
-
-      # cl, for pytensor's Cython extension and the C API test harness
-      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
-        if: runner.os == 'Windows'
 
       - name: Install
         run: |
